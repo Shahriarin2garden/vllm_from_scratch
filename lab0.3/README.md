@@ -15,17 +15,29 @@ Status: Not started
 
 The KV cache represents 40-70% of dynamic memory usage during inference. Its management dictates system throughput, latency, and maximum concurrent users. This lab moves from theory to implementation—showing you exactly how to build the memory subsystem that makes nano-vLLM possible.
 
+### **Conceptual Overview: "Tetris" for AI Memory**
+Before we write code, let's understand the core problem:
+*   **The Problem:** LLMs don't generate text in predictable blocks. One user asks a question and gets a 10-word answer; another gets a 2000-word essay.
+*   **Old Solution (Pre-vLLM):** Reserve a huge parking spot (VRAM buffer) for every car (request), assuming every car is a limousine (max length). If a generic sedan parks there, 90% of the space is wasted.
+*   **New Solution (PagedAttention):** Break the parking spot into tiny slots (Pages/Blocks). A limousine takes 50 slots scattered around the lot; a sedan takes 5. This is non-contiguous memory management, similar to how your computer's RAM works (Virtual Memory).
+
 ---
 
 ![visual-1.png](visual-1.png)
 
-![Gemini_Generated_Image_4kmtvv4kmtvv4kmt.png](Gemini_Generated_Image_4kmtvv4kmtvv4kmt.png)
+
 
 ## **Iterative Learning Path**
 
 ### **Phase 1: Foundations – Understanding the Core Problem**
 
 ### **Step 1.1: The Mathematical Necessity of Caching**
+
+**Concept Intuition:**
+Why do we need a "Cache" at all?
+Imagine translating a book. To translate page 100, you need context from pages 1-99.
+*   **Without Cache:** You re-read pages 1-99 every time you translate a single new word on page 100.
+*   **With Cache:** You take notes (Key/Value vectors) on pages 1-99 once. To translate a new word, you just glance at your notes.
 
 **The Attention Equation Without Cache**:
 
@@ -58,34 +70,37 @@ For generating token t:
 
 **Visual 1.1: Computation Without vs With KV Cache**
 
+**Detailed Explanation for Researchers:**
+*   **Quadratic vs. Linear:** The "No Cache" subgraph demonstrates the $O(n^2)$ catastrophe. For token 3, we process 3 items. For token 1000, we process 1000 items. The total work is the area of the triangle: $\sum_{i=1}^N i \approx \frac{N^2}{2}$.
+*   **The Cache Invariant:** The "With Cache" subgraph shows constant time complexity *per new token* (regarding projections) and linear time complexity for attention dot products. This shift from Triangle to Line is what makes real-time generation possible.
+
 ```mermaid
 graph TD
-    subgraph NoCache[Without KV Cache - O(n²)]
-        direction TB
-        NC1[Token 1: Process 1 token] --> NC2[Token 2: Re-process 2 tokens]
-        NC2 --> NC3[Token 3: Re-process 3 tokens]
-        NC3 --> NC4[...]
-        NC4 --> NC5[Token n: Re-process n tokens]
-        style NC5 fill:#fca5a5
-    end
-
-    subgraph WithCache[With KV Cache - O(n)]
-        direction TB
-        WC1[Token 1: Process & Cache] --> WC2[Token 2: Read cache + 1 new]
-        WC2 --> WC3[Token 3: Read cache + 1 new]
-        WC3 --> WC4[...]
-        WC4 --> WC5[Token n: Read cache + 1 new]
-        style WC2 fill:#bbf7d0
-        style WC3 fill:#bbf7d0
-        style WC5 fill:#bbf7d0
-    end
-
-    NoCache -->|"n=1000 → ~500,000 operations"| Result1[Prohibitive for Serving]
-    WithCache -->|"n=1000 → ~1,000 operations"| Result2[Practical for Real-time]
-
+    NC1[Token 1: Process 1 token] --> NC2[Token 2: Re-process 2 tokens]
+    NC2 --> NC3[Token 3: Re-process 3 tokens]
+    NC3 --> NC4[...]
+    NC4 --> NC5[Token n: Re-process n tokens]
+    
+    WC1[Token 1: Process & Cache] --> WC2[Token 2: Read cache + 1 new]
+    WC2 --> WC3[Token 3: Read cache + 1 new]
+    WC3 --> WC4[...]
+    WC4 --> WC5[Token n: Read cache + 1 new]
+    
+    NC5 -->|n=1000 → ~500k ops| Result1[Prohibitive for Serving]
+    WC5 -->|n=1000 → ~1k ops| Result2[Practical for Real-time]
+    
+    style NC5 fill:#fca5a5
+    style WC2 fill:#bbf7d0
+    style WC3 fill:#bbf7d0
+    style WC5 fill:#bbf7d0
 ```
 
 ### **Step 1.2: Naive Implementation - Contiguous Cache**
+
+**Code Explanation for Researchers:**
+This is the "standard" implementation found in most HuggingFace tutorials.
+*   **Pre-allocation:** `torch.zeros(max_seq_len, ...)` locks the memory immediately.
+*   **The Waste:** If `max_seq_len=2048` but the actual conversation is only 50 tokens, we have allocated (and blocked) memory for 1998 tokens that contain nothing but zeros. Multipy this by batch size (e.g., 64), and we are wasting gigabytes of VRAM.
 
 **Basic Implementation**:
 
@@ -119,36 +134,28 @@ class NaiveKVCache:
 
 **Visual 1.2: Memory Waste in Naive Allocation**
 
+**Detailed Explanation for Researchers:**
+*   **The "Tetris" Problem (Internal Fragmentation):** This diagram visualizes the "Internal Fragmentation" pathology. We see massive blocks of Red (Allocated but Unused) memory.
+*   **The System Impact:** Even if the physical GPU has free space, the *allocator* thinks it's full because it reserved `MaxSeqLen` for everyone. This artifically caps the batch size.
+*   **Why `MaxSeqLen`?** We are forced to guess `MaxSeqLen` upfront because standard tensor operations require contiguous memory. We can't easily resize a tensor in the middle of a CUDA kernel without expensive memory copies.
+
 ```mermaid
-graph TD
-    subgraph GPU_Memory[GPU Memory - 24GB Total]
-        direction LR
-
-        subgraph Allocated[Allocated but Unused - 18GB Wasted]
-            direction LR
-            A1[Seq A: 4K slots<br/>Actual: 512 tokens]
-            A2[Seq B: 4K slots<br/>Actual: 128 tokens]
-            A3[Seq C: 4K slots<br/>Actual: 2K tokens]
-            A4[... 100s more ...]
-        end
-
-        subgraph ActuallyUsed[Actually Used - 6GB]
-            direction LR
-            U1[512 tokens]
-            U2[128 tokens]
-            U3[2K tokens]
-            U4[...]
-        end
-
-        subgraph Free[Free - 0GB]
-            F1[No space for new requests!<br/>Despite apparent waste]
-        end
-    end
-
-    style Allocated fill:#fca5a5
-    style ActuallyUsed fill:#bbf7d0
-    style Free fill:#ef4444
-
+graph LR
+    A1[Seq A: 4K slots<br/>Actual: 512 tokens] --> A2[Seq B: 4K slots<br/>Actual: 128 tokens]
+    A2 --> A3[Seq C: 4K slots<br/>Actual: 2K tokens]
+    A3 --> A4[... 100s more ...]
+    
+    U1[Actually Used: 6GB] --> U2[512 + 128 + 2K tokens]
+    
+    F1[Free: 0GB<br/>No space for new requests<br/>Despite apparent waste]
+    
+    A4 --> Summary[18GB Wasted<br/>75% Fragmentation]
+    
+    style A1 fill:#fca5a5
+    style A2 fill:#fca5a5
+    style A3 fill:#fca5a5
+    style U1 fill:#bbf7d0
+    style F1 fill:#ef4444
 ```
 
 **Key Insight**: This is **internal fragmentation** - memory allocated but unused within each allocation.
@@ -158,6 +165,11 @@ graph TD
 ### **Phase 2: Evolution – Solving the Fragmentation Problem**
 
 ### **Step 2.1: Dynamic Allocation with Variable Blocks**
+
+**Concept Intuition:**
+This is the "Linked List" approach to memory.
+Instead of an array `[1...1000]`, we say "Here is a block of 16. If you need more, I'll give you another block of 16 and note down where it is."
+The memory is no longer physically contiguous (one big block), but logically connected.
 
 **First Improvement**: Allocate only what's needed, grow as needed.
 
@@ -200,38 +212,35 @@ class DynamicKVCache:
 
 **Visual 2.1: Dynamic vs Static Allocation**
 
+**Detailed Explanation for Researchers:**
+*   **Efficiency Gain:** The diagram contrasts the rigid "Static" containers with the flexible "Dynamic" blocks. We move from ~80% waste to ~12% waste.
+*   **The Trade-off:** We traded *memory efficiency* for *complexity*. Now, the Attention kernel can't just read `base_pointer + offset`. It has to traverse a list of blocks. This is where standard PyTorch kernels fail and custom CUDA kernels become necessary.
+
 ```mermaid
 graph TD
-    subgraph Comparison[Dynamic Allocation Improvement]
-        direction LR
-
-        subgraph Static[Static Allocation]
-            S1[Seq A: 4K pre-allocated]
-            S2[Seq B: 4K pre-allocated]
-            S3[Wasted: 7.5K slots]
-            style S3 fill:#fca5a5
-        end
-
-        subgraph Dynamic[Dynamic Allocation]
-            D1[Seq A: 2 blocks (32 tokens)]
-            D2[Seq B: 1 block (16 tokens)]
-            D3[Free: Many blocks available]
-            style D3 fill:#bbf7d0
-        end
-
-        Static -->|Fixed overhead| Problem[Can't serve many users]
-        Dynamic -->|On-demand| Solution[More concurrent users]
-    end
-
-    Metrics["
-    **Metrics for 100 concurrent sequences:**
-    - Static: 400K slots allocated, 320K wasted (80%)
-    - Dynamic: 80K slots allocated, 10K wasted (12.5%)
-    "] --> Comparison
-
+    S1[Static: Seq A<br/>4K pre-allocated] --> S2[Static: Seq B<br/>4K pre-allocated]
+    S2 --> S3[Wasted: 7.5K slots]
+    
+    D1[Dynamic: Seq A<br/>2 blocks 32 tokens] --> D2[Dynamic: Seq B<br/>1 block 16 tokens]
+    D2 --> D3[Free: Many blocks available]
+    
+    S3 -->|Fixed overhead| Problem[Cannot serve many users]
+    D3 -->|On-demand| Solution[More concurrent users]
+    
+    Metrics[100 concurrent sequences:<br/>Static: 400K slots, 320K wasted 80%<br/>Dynamic: 80K slots, 10K wasted 12.5%]
+    
+    style S3 fill:#fca5a5
+    style D3 fill:#bbf7d0
+    style Problem fill:#ef4444
+    style Solution fill:#bbf7d0
 ```
 
 ### **Step 2.2: The Fragmentation Problem Emerges**
+
+**Concept Intuition:**
+This is the "Swiss Cheese" memory problem (External Fragmentation).
+You have plenty of free memory overall (e.g., 2GB), but it's scattered in tiny 10MB holes between active programs.
+If a new user arrives and needs a contiguous 100MB block, you have to say "Out of Memory" even though you have 2GB free.
 
 **The New Problem**: When sequences finish at different times, memory becomes fragmented.
 
@@ -259,41 +268,33 @@ def demonstrate_fragmentation():
 
 **Visual 2.2: External Fragmentation Demonstrated**
 
+**Detailed Explanation for Researchers:**
+*   **The Scenario:** At T1, users A and C leave. This frees up blocks `B0-B1` and `B4-B5`.
+*   **The Paradox:** We have **4 blocks free** total (100% of what is needed). Sequence E enters needing **3 blocks**.
+*   **The Failure:** Because the free memory is split into two small islands (`[..][BB][..][DD]`), we cannot fit a contiguous chunk of size 3. The allocator throws an OOM error despite having 4 blocks available.
+
 ```mermaid
 graph TD
-    subgraph TimeT0[T=0: All sequences active]
-        direction LR
-        A1[Seq A: B0 B1 B2 B3]
-        B1[Seq B: B4 B5]
-        C1[Seq C: B6 B7 B8]
-        D1[Seq D: B9 B10 B11]
-    end
-
-    subgraph TimeT1[T=1: A & C finish]
-        direction LR
-        F1[Free: B0 B1 B2 B3]
-        B2[Seq B: B4 B5]
-        F2[Free: B6 B7 B8]
-        D2[Seq D: B9 B10 B11]
-    end
-
-    subgraph TimeT2[T=2: New Seq E needs 4 blocks]
-        direction LR
-        Need["New Sequence E<br/>Requires 4 CONTIGUOUS blocks"]
-
-        subgraph FreeBlocks[Free Blocks Available: 7 total]
-            FB1[B0 B1 B2 B3]
-            FB2[Gap: B4 B5 (used)]
-            FB3[B6 B7 B8]
-        end
-
-        Need --> Attempt[Attempt Allocation]
-        Attempt --> Result["FAILS!<br/>No 4 contiguous blocks available"]
-        style Result fill:#ef4444
-    end
-
-    TimeT0 --> TimeT1 --> TimeT2
-
+    T0[T=0: All sequences active<br/>A: B0 B1, B: B2 B3, C: B4 B5, D: B6 B7]
+    
+    T1[T=1: A & C finish<br/>Free: B0 B1, B: B2 B3, Free: B4 B5, D: B6 B7]
+    
+    T2[T=2: New Seq E needs 3 blocks]
+    
+    FB[Free Blocks: 4 total<br/>B0 B1 and B4 B5<br/>Gap: B2 B3 used]
+    
+    Attempt[Attempt Allocation]
+    
+    Result[FAILS!<br/>Max contiguous is 2<br/>External Fragmentation]
+    
+    T0 --> T1
+    T1 --> T2
+    T2 --> FB
+    FB --> Attempt
+    Attempt --> Result
+    
+    style Result fill:#ef4444
+    style FB fill:#fca5a5
 ```
 
 **Key Insight**: We've traded internal fragmentation for **external fragmentation** - free memory exists but isn't contiguous.
@@ -312,56 +313,54 @@ PagedAttention borrows from OS virtual memory:
 
 **Visual 3.1: PagedAttention Architecture Overview**
 
+**Detailed Explanation for Researchers:**
+*   **Decoupling:** This diagram shows the complete separation of Logical (Sequence) and Physical (VRAM) address spaces.
+*   **Non-Contiguous:** Notice `SeqA` uses physical blocks `42`, `17`, `85`. These are wildly out of order. This means we can fill *any* hole in VRAM with *any* part of *any* sequence.
+*   **Zero Fragmentation:** As long as there is 1 free physical block, we can store 1 more chunk of tokens. External fragmentation is effectively eliminated.
+
 ```mermaid
 graph TB
-    subgraph VirtualSpace[Virtual Address Spaces - Per Sequence]
-        direction LR
-        subgraph SeqA[Sequence A]
-            VA1[Virt Block 0<br/>Positions 0-15]
-            VA2[Virt Block 1<br/>Positions 16-31]
-            VA3[Virt Block 2<br/>Positions 32-47]
-        end
-
-        subgraph SeqB[Sequence B]
-            VB1[Virt Block 0<br/>Positions 0-15]
-            VB2[Virt Block 1<br/>Positions 16-31]
-        end
-    end
-
-    subgraph PageTables[Block Tables - Page Tables]
-        PT1["A's Table: [42, 17, 85]"]
-        PT2["B's Table: [23, 64]"]
-    end
-
-    subgraph PhysicalMemory[Physical Block Pool - Shared]
-        direction LR
-        P0[Block 0]
-        P1[Block 1]
-        P2[Block 2]
-        P3[Block 3]
-        P4[...]
-        P85[Block 85]
-        P86[Block 86]
-        P87[Free Block]
-        P88[Free Block]
-    end
-
-    SeqA --> PT1
-    SeqB --> PT2
-
-    PT1 --> P42[Block 42]
-    PT1 --> P17[Block 17]
+    VA1[Seq A: Virt Block 0<br/>Positions 0-15]
+    VA2[Seq A: Virt Block 1<br/>Positions 16-31]
+    VA3[Seq A: Virt Block 2<br/>Positions 32-47]
+    
+    VB1[Seq B: Virt Block 0<br/>Positions 0-15]
+    VB2[Seq B: Virt Block 1<br/>Positions 16-31]
+    
+    PT1[A Table: 42, 17, 85]
+    PT2[B Table: 23, 64]
+    
+    P42[Physical Block 42]
+    P17[Physical Block 17]
+    P85[Physical Block 85]
+    P23[Physical Block 23]
+    P64[Physical Block 64]
+    P87[Free Block 87]
+    P88[Free Block 88]
+    
+    VA1 --> PT1
+    VA2 --> PT1
+    VA3 --> PT1
+    VB1 --> PT2
+    VB2 --> PT2
+    
+    PT1 --> P42
+    PT1 --> P17
     PT1 --> P85
-    PT2 --> P23[Block 23]
-    PT2 --> P64[Block 64]
-
-    style PhysicalMemory fill:#f3f4f6
+    PT2 --> P23
+    PT2 --> P64
+    
     style P87 fill:#bbf7d0
     style P88 fill:#bbf7d0
-
 ```
 
 ### **Step 3.2: Core Data Structures Implementation**
+
+**Code Explanation for Researchers:**
+This class `PagedKVCache` is the heart of the lab.
+*   **`self.kv_data`:** This is the massive pre-allocated GPU tensor. It reserves *all* VRAM at startup.
+*   **`block_tables`:** This Python dictionary replaces the simple list/pointer. It maps `seq_id` to a list of integers (block indices).
+*   **`write_token`**: This method performs the critical translation: `Logical Token Index -> Physical Block Index`. This math `block_idx = token_idx // block_size` is exactly how MMUs (Memory Management Units) work in hardware.
 
 ```python
 class PagedKVCache:
@@ -425,7 +424,7 @@ class PagedKVCache:
         k_blocks = []
         v_blocks = []
 
-for i in range(num_blocks_needed):
+        for i in range(num_blocks_needed):
             if i >= len(blocks):
                 raise IndexError(f"Block index {i} out of range for blocks list of length {len(blocks)}")
             block = blocks[i]
@@ -448,43 +447,47 @@ for i in range(num_blocks_needed):
 
 **Visual 3.2: Memory Access with Block Tables**
 
+**Detailed Explanation for Researchers:**
+*   **The Indirection Cost:** This diagram highlights the trade-off. We pay for memory efficiency with *pointers*.
+*   **The Translation Layer:** In "Step 2", notice the math `Block idx = 42 // 16`. This computation is trivial for a CPU, but inside a massive GPU kernel running on 100,000 threads, managing these lookups efficiently requires coalesced memory access patterns to avoid "Memory Divergence".
+*   **Kernel Complexity:** Step 4 implies the complexity. The PagedAttention kernel is *not* just a standard MatMul. It is a gather-compute-scatter operation.
+
 ```mermaid
-graph LR
-    subgraph RequestFlow[Request Processing with PagedAttention]
-        direction TB
-
-        subgraph Step1[1. Token Arrives]
-            T1["Token at position 42<br/>Sequence ID: 'chat_123'"]
-        end
-
-        subgraph Step2[2. Block Table Lookup]
-            BT["block_tables['chat_123'] = [15, 87, 42, 91]"]
-            Calc["Block idx = 42 ÷ 16 = 2<br/>Offset = 42 % 16 = 10"]
-            Map["Physical block = block_table[2] = 42"]
-        end
-
-        subgraph Step3[3. Physical Memory Access]
-            PM["Physical Block 42<br/>Slot 10 (offset 10)"]
-            Read["Read/Write K/V at [block=42, slot=10]"]
-        end
-
-        subgraph Step4[4. Kernel Execution]
-            Kernel["PagedAttention Kernel<br/>Input: Q, block_tables, seq_lens<br/>Processes 100s of tokens in parallel"]
-        end
-
-        Step1 --> Step2 --> Step3 --> Step4
-    end
-
-    Efficiency["
-    **Key Advantages:**
-    1. **Zero fragmentation**: Any free block can satisfy any request
-    2. **O(1) allocation**: Just pop from free_blocks deque
-    3. **Efficient sharing**: Multiple sequences can share blocks
-    "] --> RequestFlow
-
+graph TD
+    T1[1. Token Arrives<br/>Position 42<br/>Sequence: chat_123]
+    
+    BT[2. Block Table Lookup<br/>block_tables chat_123 = 15, 87, 42, 91]
+    
+    Calc[3. Calculate Address<br/>Block idx = 42 ÷ 16 = 2<br/>Offset = 42 % 16 = 10]
+    
+    Map[4. Map to Physical<br/>Physical block = table 2 = 42]
+    
+    PM[5. Physical Memory Access<br/>Block 42, Slot 10]
+    
+    Read[6. Read/Write K/V<br/>at block=42, slot=10]
+    
+    Kernel[7. PagedAttention Kernel<br/>Input: Q, block_tables, seq_lens<br/>Processes 100s tokens parallel]
+    
+    T1 --> BT --> Calc --> Map --> PM --> Read --> Kernel
+    
+    Efficiency[Key Advantages:<br/>Zero fragmentation<br/>O1 allocation<br/>Efficient sharing]
+    
+    Kernel --> Efficiency
 ```
 
 ### **Step 3.3: The Slot Mapping Optimization**
+
+**Concept Intuition:**
+This is the "Compiler" step for memory.
+Python logic (class`PagedKVCache`) is slow. The GPU is fast.
+We don't want the GPU asking Python "Where is block 5?" for every token.
+Instead, we compile a massive cheatsheet (`SlotMapping`) in one go. We hand this tensor to the GPU and say: "Here is the exact address of every single byte you will need for the next millisecond. Go."
+
+**Code Explanation for Researchers:**
+The function `build_slot_mapping` constructs the **Flattened State**.
+Typical PyTorch works on `[Batch, Seq, Dim]`.
+vLLM works on `[Total_Tokens_In_Batch, Dim]`.
+This function flattens the hierarchical structure (Batch -> Sequence -> Block -> Token) into a flat list of physical pointers (`slot_k`, `slot_v`) so the CUDA kernel can trust blindly.
 
 The real performance comes from preparing data for the GPU kernel.
 
@@ -570,37 +573,34 @@ def paged_attention_forward(q: Tensor, slot_mapping: SlotMapping,
 
 **Visual 3.3: Slot Mapping Construction**
 
+**Detailed Explanation for Researchers:**
+*   **Sequential vs. Parallel:** This diagram shows how we break the sequential dependency of "Batch Processing".
+*   **The Flattening:** By flattening all tokens into a single array (18 tokens), we allow the GPU to launch 18 parallel threads (or thread blocks) that are completely independent. Thread #17 knows exactly where to find its data without asking Thread #0.
+*   **Coalescing:** The `SlotMapping` tensor itself is stored contiguously in memory. This ensures that when the GPU Warps load the mapping, they do so efficiently, before scattering to read the actual KV data.
+
 ```mermaid
-graph TB
-    subgraph Batch[Batch of Sequences]
-        S1["Sequence A: 5 tokens<br/>Block Table: [42, 15]"]
-        S2["Sequence B: 10 tokens<br/>Block Table: [23, 64, 87]"]
-        S3["Sequence C: 3 tokens<br/>Block Table: [91]"]
-    end
-
-    subgraph TokenPositions[Token Positions in Batch]
-        TP["Flattened: [A₀, A₁, A₂, A₃, A₄, B₀, B₁, ..., B₉, C₀, C₁, C₂]<br/>Total: 18 tokens"]
-    end
-
-    subgraph SlotCalc[Slot Calculation Process]
-        SC1["For each token:<br/>1. Get sequence's block table<br/>2. Calculate: block_idx = pos ÷ 16<br/>3. Calculate: offset = pos % 16<br/>4. Get physical block<br/>5. Compute slot = block × 32 + offset × 2"]
-
-        Example["Example: Sequence B, token 25<br/>Block Table: [23, 64, 87]<br/>block_idx = 25 ÷ 16 = 1<br/>offset = 25 % 16 = 9<br/>physical_block = 64<br/>slot = 64 × 32 + 9 × 2 = 2050"]
-    end
-
-    subgraph Result[Resulting Slot Mapping Tensor]
-        SM["slot_mapping = [<br/>  [1344, 1345],  # A₀: block 42, offset 0<br/>  [1346, 1347],  # A₁: block 42, offset 1<br/>  ...,<br/>  [2050, 2051],  # B₂₅: block 64, offset 9<br/>  ...<br/>]"]
-    end
-
-    Batch --> TokenPositions --> SlotCalc --> Result
-
-    Note["
-    **Why This Matters:**
-    - Single tensor tells kernel where every token's K/V lives
-    - Enables parallel random access across all sequences
-    - No per-sequence logic in kernel → simpler, faster
-    "] --> SlotCalc
-
+graph TD
+    S1[Sequence A: 5 tokens<br/>Block Table: 42, 15]
+    S2[Sequence B: 10 tokens<br/>Block Table: 23, 64, 87]
+    S3[Sequence C: 3 tokens<br/>Block Table: 91]
+    
+    TP[Flattened Tokens<br/>A0 A1 A2 A3 A4 B0...B9 C0 C1 C2<br/>Total: 18 tokens]
+    
+    SC1[Slot Calculation:<br/>1. Get block table<br/>2. block_idx = pos ÷ 16<br/>3. offset = pos % 16<br/>4. Get physical block<br/>5. slot = block × 32 + offset × 2]
+    
+    Example[Example: Seq B token 25<br/>block_idx = 25 ÷ 16 = 1<br/>offset = 25 % 16 = 9<br/>physical_block = 64<br/>slot = 64 × 32 + 9 × 2 = 2050]
+    
+    SM[Slot Mapping Tensor<br/>1344,1345 for A0<br/>1346,1347 for A1<br/>2050,2051 for B25]
+    
+    Note[Single tensor for all tokens<br/>Parallel random access<br/>No per-sequence logic]
+    
+    S1 --> TP
+    S2 --> TP
+    S3 --> TP
+    TP --> SC1
+    SC1 --> Example
+    Example --> SM
+    SM --> Note
 ```
 
 ---
@@ -608,6 +608,15 @@ graph TB
 ### **Phase 4: Advanced Optimizations**
 
 ### **Step 4.1: Block-Sparse Attention**
+
+**Concept Intuition:**
+Imagine you are reading a 1000-page history book. To understand page 1000, do you really need to remember every single detail from page 5? Probably not. You mostly need the recent chapters (Local Attention) and maybe a few key events from the start (Sink Tokens).
+Block-Sparse Attention says: "Let's not load the irrelevant pages into the extremeley expensive GPU L1 cache."
+
+**Code Explanation for Researchers:**
+The `BlockSparsePagedAttention` class introduces a `sparsity_pattern` mask.
+Instead of the standard `read_for_attention` which grabs *everything*, `sparse_read` filters the block list.
+This reduces the memory bandwidth requirement from $O(N)$ to $O(\text{window\_size})$, which is a massive speedup for long-context models.
 
 Not all tokens need attention to all previous tokens. We can skip loading irrelevant blocks.
 
@@ -658,44 +667,60 @@ class BlockSparsePagedAttention(PagedKVCache):
 
 **Visual 4.1: Block-Sparse vs Full Attention**
 
+**Detailed Explanation for Researchers:**
+*   **The Traffic Reduction:** The metric "62.5% reduction in memory traffic" is the key takeaway. In a bandwidth-bound regime (Decode phase), this directly translates to a ~2x speedup.
+*   **Coarse-Grained Sparsity:** Notice we drop *entire blocks*, not individual tokens. Dropping tokens creates irregular memory access (bad for GPU). Dropping blocks keeps the access patterns effectively dense (compresses well), while skipping large chunks of HBM reads.
+
 ```mermaid
 graph TD
-    subgraph FullAttention[Full Attention - All-to-All]
-        direction LR
-        FA1[Block 0] -->|Attends to| FA2[All 8 blocks]
-        FA2 --> FA3[Block 1] --> FA4[All 8 blocks]
-        FA5[Block 2] --> FA6[All 8 blocks]
-        FA7[...] --> FA8[...]
-        FA9[Block 7] --> FA10[All 8 blocks]
-    end
-
-    subgraph SparseAttention[Block-Sparse (Window=3)]
-        direction LR
-        SA1[Block 0] -->|Attends to| SA2[Blocks 0]
-        SA3[Block 1] --> SA4[Blocks 0-1]
-        SA5[Block 2] --> SA6[Blocks 0-2]
-        SA7[Block 3] --> SA8[Blocks 1-3]
-        SA9[Block 4] --> SA10[Blocks 2-4]
-        SA11[Block 5] --> SA12[Blocks 3-5]
-        SA13[Block 6] --> SA14[Blocks 4-6]
-        SA15[Block 7] --> SA16[Blocks 5-7]
-    end
-
-    Metrics["
-    **Performance Comparison (8 blocks):**
-    - Full: 64 block-pairs loaded
-    - Sparse (window=3): 24 block-pairs loaded
-    - **62.5% reduction in memory traffic**
-    "] --> SparseAttention
-
-    style FullAttention fill:#f3f4f6
-    style SparseAttention fill:#bbf7d0
-
+    FA1[Full Attention:<br/>Block 0 → All 8 blocks]
+    FA2[Block 1 → All 8 blocks]
+    FA3[Block 2 → All 8 blocks]
+    FA4[Block 7 → All 8 blocks]
+    
+    SA1[Sparse Window=3:<br/>Block 0 → Block 0]
+    SA2[Block 1 → Blocks 0-1]
+    SA3[Block 2 → Blocks 0-2]
+    SA4[Block 3 → Blocks 1-3]
+    SA5[Block 4 → Blocks 2-4]
+    SA6[Block 5 → Blocks 3-5]
+    SA7[Block 6 → Blocks 4-6]
+    SA8[Block 7 → Blocks 5-7]
+    
+    Metrics[Performance 8 blocks:<br/>Full: 64 block-pairs<br/>Sparse: 24 block-pairs<br/>62.5% reduction]
+    
+    FA1 --> FA2 --> FA3 --> FA4
+    SA1 --> SA2 --> SA3 --> SA4 --> SA5 --> SA6 --> SA7 --> SA8
+    SA8 --> Metrics
+    
+    style FA1 fill:#f3f4f6
+    style FA2 fill:#f3f4f6
+    style FA3 fill:#f3f4f6
+    style FA4 fill:#f3f4f6
+    style SA1 fill:#bbf7d0
+    style SA2 fill:#bbf7d0
+    style SA3 fill:#bbf7d0
+    style SA4 fill:#bbf7d0
+    style SA5 fill:#bbf7d0
+    style SA6 fill:#bbf7d0
+    style SA7 fill:#bbf7d0
+    style SA8 fill:#bbf7d0
 ```
 
 ### **Step 4.2: Prefix Caching & Sharing**
 
+**Concept Intuition:**
+This is "Deduplication" for prompts.
+In a chatbot, almost every request starts with "You are a helpful assistant...".
+In RAG (Retrieval Augmented Generation), multiple questions might share the same massive wikipedia article as context.
+Instead of storing "You are a helpful assistant..." 1000 times (wasting 1GB), we store it once and have 1000 users point to it. This uses Reference Counting.
+
 Common prefixes (system prompts) can be shared across sequences.
+
+**Code Explanation for Researchers:**
+The `PrefixCachingKVCache` class demonstrates the Copy-on-Write mechanism.
+*   **`prefix_cache`:** A hash map acting as the "deduplication table".
+*   **`block_refcount`:** The critical safety mechanism. Notice in `free_sequence`, we *decrement* but only *free* if count reaches zero. This prevents "User A finishes and deletes the system prompt while User B is still using it."
 
 ```python
 class PrefixCachingKVCache(PagedKVCache):
@@ -751,45 +776,46 @@ class PrefixCachingKVCache(PagedKVCache):
 
 **Visual 4.2: Prefix Sharing in Action**
 
+**Detailed Explanation for Researchers:**
+*   **Copy-on-Write (CoW):** This mechanism is identical to how OS processes fork(). The child process shares the parent's memory pages until it writes to one.
+*   **The RefCount:** The key operational detail (implicit in the diagram) is Reference Counting. Block `B42` has `ref_count=3`. We cannot free `B42` until *all three* users finish their requests.
+*   **Radix Tree:** In production vLLM, this lookup (system prompt -> hash -> blocks) is implemented via a Radix Tree (Trie), allowing automatic prefix matching even if the user didn't explicitly flag it as a "system prompt".
+
 ```mermaid
-graph TB
-    subgraph SystemPrompt[Common System Prompt]
-        SP["'You are a helpful assistant...'<br/>Hash: abc123<br/>Length: 12 tokens"]
-    end
-
-    subgraph UserRequests[User Requests Sharing Prefix]
-        UR1["User 1: 'Explain quantum physics'<br/>Total: 12 + 3 = 15 tokens"]
-        UR2["User 2: 'Write a poem about AI'<br/>Total: 12 + 5 = 17 tokens"]
-        UR3["User 3: 'Debug this Python code'<br/>Total: 12 + 6 = 18 tokens"]
-    end
-
-    subgraph PhysicalMemory[Physical Memory Layout]
-        direction LR
-        P1[Prefix Blocks:<br/>B42, B87, B15]
-        P2[User 1 unique:<br/>B23]
-        P3[User 2 unique:<br/>B64, B91]
-        P4[User 3 unique:<br/>B33, B78]
-    end
-
-    subgraph BlockTables[Block Tables]
-        BT1["User 1: [42, 87, 15, 23]"]
-        BT2["User 2: [42, 87, 15, 64, 91]"]
-        BT3["User 3: [42, 87, 15, 33, 78]"]
-    end
-
-    SystemPrompt -->|Shared by| UserRequests
-    UserRequests --> BlockTables
-    BlockTables --> PhysicalMemory
-
-    Metrics["
-    **Memory Savings:**
-    - Without sharing: 9 blocks for prefixes (3 each)
-    - With sharing: 3 blocks total for prefixes
-    - **66% reduction** in prefix memory
-    "] --> PhysicalMemory
-
+graph TD
+    SP[System Prompt<br/>You are a helpful assistant<br/>Hash: abc123<br/>Length: 12 tokens]
+    
+    UR1[User 1: Explain quantum physics<br/>Total: 15 tokens]
+    UR2[User 2: Write a poem about AI<br/>Total: 17 tokens]
+    UR3[User 3: Debug this Python code<br/>Total: 18 tokens]
+    
+    BT1[User 1 Table: 42, 87, 15, 23]
+    BT2[User 2 Table: 42, 87, 15, 64, 91]
+    BT3[User 3 Table: 42, 87, 15, 33, 78]
+    
+    P1[Prefix Blocks SHARED:<br/>B42, B87, B15]
+    P2[User 1 unique: B23]
+    P3[User 2 unique: B64, B91]
+    P4[User 3 unique: B33, B78]
+    
+    Metrics[Memory Savings:<br/>Without: 9 blocks 3 each<br/>With: 3 blocks shared<br/>66% reduction]
+    
+    SP --> UR1
+    SP --> UR2
+    SP --> UR3
+    UR1 --> BT1
+    UR2 --> BT2
+    UR3 --> BT3
+    BT1 --> P1
+    BT2 --> P1
+    BT3 --> P1
+    BT1 --> P2
+    BT2 --> P3
+    BT3 --> P4
+    P1 --> Metrics
+    
     style P1 fill:#fef3c7
-
+    style Metrics fill:#bbf7d0
 ```
 
 ---
