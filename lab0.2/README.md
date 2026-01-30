@@ -1,4 +1,4 @@
-# lab 0.22222d
+# lab 0.2
 
 Status: Not started
 
@@ -6,7 +6,7 @@ Status: Not started
 
 **A Comprehensive Guide to Autoregressive Inference, Scheduling, and Modern Optimizations**
 
-![Gemini_Generated_Image_zcznrgzcznrgzczn (1).png](Gemini_Generated_Image_zcznrgzcznrgzczn_(1).png)
+![architecture_02](architecture_02)
 
 ## **1. Introduction: The Heartbeat of LLM Inference**
 
