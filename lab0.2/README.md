@@ -21,6 +21,19 @@ P(w₁, w₂, ..., w_T) = Π P(w_t | w₁, w₂, ..., w_{t-1})
 
 Each token generation depends on the entire preceding sequence, creating a **sequential dependency** that cannot be parallelized across tokens. This fundamental constraint leads to the two-phase architecture.
 
+**Why This Matters:**
+- **Training vs Inference**: During training, we can compute all positions in parallel because we have the full sequence. During inference, we must generate one token at a time.
+- **Memory-Compute Trade-off**: We trade memory (storing KV cache) for compute (avoiding recomputation).
+- **Latency Impact**: Each token requires a full forward pass through the model, making generation inherently sequential.
+
+**Real-World Example:**
+For GPT-3 (175B parameters) generating 100 tokens:
+- Without KV cache: ~500 seconds (recomputing everything)
+- With KV cache: ~5 seconds (using cached computations)
+- **100× speedup** from caching alone!
+
+> **Research Reference**: "Attention Is All You Need" (Vaswani et al., 2017) - The foundational paper that introduced the Transformer architecture and autoregressive generation.
+
 ### **1.2 Computational Graph Decomposition**
 
 The forward pass of a Transformer layer for token generation can be represented as:
@@ -35,6 +48,42 @@ Where:
 - `h_t` = hidden state at position t
 - `K_{1:t-1}`, `V_{1:t-1}` = cached Key/Value vectors from previous tokens
 
+**Deep Dive: Why Cache Keys and Values?**
+
+In the attention mechanism:
+```
+Attention(Q, K, V) = softmax(QKᵀ/√d_k)V
+```
+
+For each new token:
+- **Query (Q)**: Computed fresh for the current token only
+- **Keys (K)**: Needed from ALL previous tokens (including current)
+- **Values (V)**: Needed from ALL previous tokens (including current)
+
+Without caching, we'd recompute K and V for all previous tokens at every step:
+- Token 1: Compute K₁, V₁ (1 computation)
+- Token 2: Recompute K₁, V₁ + compute K₂, V₂ (2 computations)
+- Token 3: Recompute K₁, V₁, K₂, V₂ + compute K₃, V₃ (3 computations)
+- Token N: N computations
+- **Total: O(N²) complexity!**
+
+With caching:
+- Token 1: Compute and cache K₁, V₁
+- Token 2: Read K₁, V₁ from cache + compute K₂, V₂
+- Token 3: Read K₁, V₁, K₂, V₂ from cache + compute K₃, V₃
+- **Total: O(N) complexity!**
+
+**Performance Impact Table:**
+
+| Sequence Length | Without Cache (ops) | With Cache (ops) | Speedup |
+|----------------|---------------------|------------------|----------|
+| 10 tokens | 55 | 10 | 5.5× |
+| 100 tokens | 5,050 | 100 | 50.5× |
+| 1000 tokens | 500,500 | 1,000 | 500.5× |
+| 2048 tokens | 2,098,176 | 2,048 | 1024× |
+
+> **Research Reference**: "Generating Long Sequences with Sparse Transformers" (Child et al., 2019) - Discusses the computational complexity of attention and caching strategies.
+
 ### **1.3 From Mathematical Model to System Architecture**
 
 The two-phase architecture emerges naturally from this formulation:
@@ -46,29 +95,29 @@ The two-phase architecture emerges naturally from this formulation:
 flowchart TD
     subgraph A[Mathematical Foundation]
         direction TB
-        P[Chain Rule:<br>Pw1..T = ΠPwt|w1..t-1]
-        G[Generation:<br>wt = argmaxPwt|w1..t-1]
+        P["Chain Rule:<br/>P(w1..T) = ΠP(wt|w1..t-1)"]
+        G["Generation:<br/>wt = argmax P(wt|w1..t-1)"]
     end
 
     subgraph B[Computational Decomposition]
-        C[Forward Pass:<br>ht = Transformerht-1, K1:t-1, V1:t-1]
+        CD["Forward Pass:<br/>ht = Transformer(ht-1, K1:t-1, V1:t-1)"]
     end
 
-    subgraph C[System Architecture]
+    subgraph SA[System Architecture]
         direction LR
-        Pre[Prefill Phase<br>Parallel Compute K1:S, V1:S]
-        Dec[Decode Phase<br>Iterative ht using Cache]
+        Pre["Prefill Phase<br/>Parallel Compute K1:S, V1:S"]
+        Dec["Decode Phase<br/>Iterative ht using Cache"]
     end
 
-    A --> B --> C
+    A --> B --> SA
 
     subgraph D[Hardware Mapping]
-        CPU[CPU: Scheduling]
-        GPU[GPU: Compute]
-        MEM[VRAM: KV Cache]
+        CPU["CPU: Scheduling"]
+        GPU["GPU: Compute"]
+        MEM["VRAM: KV Cache"]
     end
 
-    C --> D
+    SA --> D
 
 ```
 
@@ -79,11 +128,11 @@ flowchart TD
 ```mermaid
 timeline
     title Evolution of LLM Inference Systems
-    2018-2020 : Naive Inference<br>Full recomputation
-    2020-2021 : KV Cache<br>Cached attention states
-    2021-2022 : Dynamic Batching<br>Improved utilization
-    2022-2023 : Continuous Batching<br>vLLM, TGI
-    2023-2024 : Disaggregated Architectures<br>Specialized hardware
+    2018-2020 : Naive Inference : Full recomputation
+    2020-2021 : KV Cache : Cached attention states
+    2021-2022 : Dynamic Batching : Improved utilization
+    2022-2023 : Continuous Batching : vLLM, TGI
+    2023-2024 : Disaggregated Architectures : Specialized hardware
 
 ```
 
@@ -94,25 +143,25 @@ timeline
 ```mermaid
 flowchart TD
     subgraph S[Software Stack]
-        API[API Layer<br>REST/gRPC]
-        SCH[Scheduler<br>Continuous Batching]
-        MEM[Memory Manager<br>PagedAttention]
-        KER[Kernel Optimizer<br>FlashAttention, etc.]
+        API["API Layer<br/>REST/gRPC"]
+        SCH["Scheduler<br/>Continuous Batching"]
+        MEM["Memory Manager<br/>PagedAttention"]
+        KER["Kernel Optimizer<br/>FlashAttention, etc."]
     end
 
     subgraph H[Hardware Stack]
-        PCIE[PCIe/NVLink<br>Interconnect]
-        HBM[HBM Memory<br>Bandwidth Optimized]
-        SM[Streaming Multiprocessors<br>Compute Optimized]
-        TC[Tensor Cores<br>Mixed Precision]
+        PCIE["PCIe/NVLink<br/>Interconnect"]
+        HBM["HBM Memory<br/>Bandwidth Optimized"]
+        SM["Streaming Multiprocessors<br/>Compute Optimized"]
+        TC["Tensor Cores<br/>Mixed Precision"]
     end
 
     S <--> H
 
     subgraph M[Metrics]
-        TTFT[Time-To-First-Token]
-        TPOT[Time-Per-Output-Token]
-        THR[Throughput<br>Tokens/sec/GPU]
+        TTFT["Time-To-First-Token"]
+        TPOT["Time-Per-Output-Token"]
+        THR["Throughput<br/>Tokens/sec/GPU"]
     end
 
     S --> M
@@ -126,23 +175,23 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph P[Pipeline Stages]
-        R[Request Arrival]
-        T[Tokenization]
-        B[Batching]
-        PF[Prefill Execution]
-        DC[Decode Execution]
-        DT[Detokenization]
-        S[Streaming Response]
+        R["Request Arrival"]
+        T["Tokenization"]
+        B["Batching"]
+        PF["Prefill Execution"]
+        DC["Decode Execution"]
+        DT["Detokenization"]
+        S["Streaming Response"]
     end
 
     R --> T --> B --> PF --> DC --> DT --> S
 
     subgraph L[Latency Contributors]
-        L1[Network]
-        L2[Queueing]
-        L3[Compute Prefill]
-        L4[Compute Decode]
-        L5[Serialization]
+        L1["Network"]
+        L2["Queueing"]
+        L3["Compute Prefill"]
+        L4["Compute Decode"]
+        L5["Serialization"]
     end
 
     P --> L
@@ -182,31 +231,31 @@ The `S/d_model` term represents the quadratic attention cost.
 
 ```mermaid
 flowchart TD
-    subgraph HBM[High Bandwidth Memory ~40-80GB]
-        W[Model Weights<br>FP16/INT8]
-        IO[Intermediate Outputs<br>Activation Checkpointing]
+    subgraph HBM["High Bandwidth Memory ~40-80GB"]
+        W["Model Weights<br/>FP16/INT8"]
+        IO["Intermediate Outputs<br/>Activation Checkpointing"]
     end
 
-    subgraph L2[L2 Cache ~40MB]
-        TC[Tiling Cache<br>For Large Matrices]
+    subgraph L2["L2 Cache ~40MB"]
+        TC["Tiling Cache<br/>For Large Matrices"]
     end
 
-    subgraph L1[L1/SRAM ~10-20MB]
-        Reg[Register File<br>Tensor Core Operands]
+    subgraph L1["L1/SRAM ~10-20MB"]
+        Reg["Register File<br/>Tensor Core Operands"]
     end
 
-    subgraph SM[Streaming Multiprocessor]
-        TCU[Tensor Core Unit<br>Matrix Multiply]
-        FPU[FP32 Units<br>Softmax, LayerNorm]
+    subgraph SM["Streaming Multiprocessor"]
+        TCU["Tensor Core Unit<br/>Matrix Multiply"]
+        FPU["FP32 Units<br/>Softmax, LayerNorm"]
     end
 
     HBM --> L2 --> L1 --> SM
 
-    subgraph Dataflow[Typical Dataflow]
+    subgraph Dataflow["Typical Dataflow"]
         direction LR
-        Load[Load Weights & Activations]
-        Compute[Tensor Core GEMM]
-        Store[Store Results]
+        Load["Load Weights & Activations"]
+        Compute["Tensor Core GEMM"]
+        Store["Store Results"]
     end
 
     SM --> Dataflow
@@ -219,30 +268,30 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph FullAttention[Full Attention - Prefill]
-        Q[Q: S × d]
-        K[K: S × d]
+    subgraph FullAttention["Full Attention - Prefill"]
+        Q["Q: S × d"]
+        K["K: S × d"]
 
-        Q --> MM1[Matrix Multiply<br>FLOPs: 2S²d]
+        Q --> MM1["Matrix Multiply<br/>FLOPs: 2S²d"]
         K --> MM1
 
-        MM1 --> SM[Softmax<br>FLOPs: 3S²]
-        SM --> MM2[Matrix Multiply<br>FLOPs: 2S²d]
+        MM1 --> SM["Softmax<br/>FLOPs: 3S²"]
+        SM --> MM2["Matrix Multiply<br/>FLOPs: 2S²d"]
 
-        V[V: S × d] --> MM2
-        MM2 --> O[Output: S × d]
+        V["V: S × d"] --> MM2
+        MM2 --> O["Output: S × d"]
     end
 
-    subgraph Memory[Movement Costs]
-        M1[Load Q,K,V: 3Sd × bytes]
-        M2[Store Attn: S² × bytes]
-        M3[Store O: Sd × bytes]
+    subgraph Memory["Movement Costs"]
+        M1["Load Q,K,V: 3Sd × bytes"]
+        M2["Store Attn: S² × bytes"]
+        M3["Store O: Sd × bytes"]
     end
 
     FullAttention --> Memory
 
-    subgraph ArithIntensity[Arithmetic Intensity]
-        AI[AI = Total FLOPs / Total Bytes<br>For S=1024, d=128, FP16:<br>AI ≈ 180 FLOPs/Byte]
+    subgraph ArithIntensity["Arithmetic Intensity"]
+        AI["AI = Total FLOPs / Total Bytes<br/>For S=1024, d=128, FP16:<br/>AI ≈ 180 FLOPs/Byte"]
     end
 
     Memory --> ArithIntensity
@@ -255,37 +304,37 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph KVCache[KV Cache Population]
+    subgraph KVCache["KV Cache Population"]
         direction LR
 
-        subgraph L1[Layer 1]
-            K1[K Cache: B×S×H×D_h]
-            V1[V Cache: B×S×H×D_h]
+        subgraph L1["Layer 1"]
+            K1["K Cache: B×S×H×D_h"]
+            V1["V Cache: B×S×H×D_h"]
         end
 
-        subgraph L2[Layer 2]
-            K2[K Cache]
-            V2[V Cache]
+        subgraph L2["Layer 2"]
+            K2["K Cache"]
+            V2["V Cache"]
         end
 
-        subgraph LN[Layer N]
-            KN[K Cache]
-            VN[V Cache]
+        subgraph LN["Layer N"]
+            KN["K Cache"]
+            VN["V Cache"]
         end
     end
 
-    subgraph Compute[Compute Pattern]
-        Para[Parallel Across:<br>• Batch Dimension<br>• Sequence Dimension<br>• Head Dimension]
+    subgraph Compute["Compute Pattern"]
+        Para["Parallel Across:<br/>• Batch Dimension<br/>• Sequence Dimension<br/>• Head Dimension"]
 
-        Seq[Sequential Across:<br>• Layer Dimension]
+        Seq["Sequential Across:<br/>• Layer Dimension"]
     end
 
     Compute --> KVCache
 
-    subgraph Layout[Memory Layout Options]
-        Inter[Interleaved:<br>[B][S][H][D_h]]
-        Split[Split Heads:<br>[B][H][S][D_h]]
-        Block[Blocked:<br>For PagedAttention]
+    subgraph Layout["Memory Layout Options"]
+        Inter["Interleaved:<br/>[B][S][H][D_h]"]
+        Split["Split Heads:<br/>[B][H][S][D_h]"]
+        Block["Blocked:<br/>For PagedAttention"]
     end
 
     KVCache --> Layout
@@ -298,33 +347,33 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph Opt[Optimization Techniques]
-        Flash[FlashAttention<br>IO-Aware Algorithm]
-        Tiling[Tiling<br>Decompose Large Matrices]
-        Quant[Quantization<br>FP8/INT4 for GEMM]
-        Fusion[Kernel Fusion<br>Combine Operations]
+    subgraph Opt["Optimization Techniques"]
+        Flash["FlashAttention<br/>IO-Aware Algorithm"]
+        Tiling["Tiling<br/>Decompose Large Matrices"]
+        Quant["Quantization<br/>FP8/INT4 for GEMM"]
+        Fusion["Kernel Fusion<br/>Combine Operations"]
     end
 
-    subgraph FlashDetail[FlashAttention Details]
+    subgraph FlashDetail["FlashAttention Details"]
         direction LR
-        Load[Load Tile to SRAM]
-        Compute[Compute on Tile]
-        Write[Write Output]
-        Softmax[Tiled Softmax]
+        Load["Load Tile to SRAM"]
+        Compute["Compute on Tile"]
+        Write["Write Output"]
+        Softmax["Tiled Softmax"]
     end
 
     Flash --> FlashDetail
 
-    subgraph Perf[Performance Impact]
-        Speed[3-5× Speedup]
-        Mem[5-10× Memory Reduction]
+    subgraph Perf["Performance Impact"]
+        Speed["3-5× Speedup"]
+        Mem["5-10× Memory Reduction"]
     end
 
     Opt --> Perf
 
-    subgraph Code[Code Example]
-        Pseudo[Pseudo-code for tiled attention]
-        Real[Real kernel implementation]
+    subgraph Code["Code Example"]
+        Pseudo["Pseudo-code for tiled attention"]
+        Real["Real kernel implementation"]
     end
 
 ```
@@ -767,34 +816,34 @@ The complexity is O(t × d_model) per step, or O(N²) total for N tokens.
 
 ```mermaid
 flowchart TD
-    subgraph MemoryAccess[Memory Access per Decode Step]
+    subgraph MemoryAccess["Memory Access per Decode Step"]
         direction TB
 
-        subgraph HBM[HBM Access - Dominant Cost]
-            W[Model Weights<br>Size: 2×Params bytes]
-            KVC[KV Cache Read<br>Size: 2×t×L×H×D_h bytes]
-            NewKV[KV Cache Write<br>Size: 2×L×H×D_h bytes]
+        subgraph HBM["HBM Access - Dominant Cost"]
+            W["Model Weights<br/>Size: 2×Params bytes"]
+            KVC["KV Cache Read<br/>Size: 2×t×L×H×D_h bytes"]
+            NewKV["KV Cache Write<br/>Size: 2×L×H×D_h bytes"]
         end
 
-        subgraph Compute[Compute - Minimal]
-            QKV[QKV Projection<br>FLOPs: 6×B×d²]
-            Attn[Attention<br>FLOPs: 2×B×t×d]
-            Proj[Output Projection<br>FLOPs: 2×B×d²]
+        subgraph Compute["Compute - Minimal"]
+            QKV["QKV Projection<br/>FLOPs: 6×B×d²"]
+            Attn["Attention<br/>FLOPs: 2×B×t×d"]
+            Proj["Output Projection<br/>FLOPs: 2×B×d²"]
         end
 
-        subgraph ArithmeticIntensity[Arithmetic Intensity Calculation]
-            TotalFLOPs[Total FLOPs: ~2N + 2tN/L]
-            TotalBytes[Total Bytes: Model + KVCache]
-            AI[AI = FLOPs / Bytes<br>Typically 0.1-1 FLOP/Byte]
+        subgraph ArithmeticIntensity["Arithmetic Intensity Calculation"]
+            TotalFLOPs["Total FLOPs: ~2N + 2tN/L"]
+            TotalBytes["Total Bytes: Model + KVCache"]
+            AI["AI = FLOPs / Bytes<br/>Typically 0.1-1 FLOP/Byte"]
         end
     end
 
     HBM --> Compute --> ArithmeticIntensity
 
-    subgraph Bottleneck[Bottleneck Analysis]
-        BW[Memory Bandwidth: 1-2 TB/s]
-        MaxFLOPs[Max FLOPs: BW × AI]
-        Compare[Compare with Peak FLOPs<br>If MaxFLOPs << PeakFLOPs: Memory Bound]
+    subgraph Bottleneck["Bottleneck Analysis"]
+        BW["Memory Bandwidth: 1-2 TB/s"]
+        MaxFLOPs["Max FLOPs: BW × AI"]
+        Compare["Compare with Peak FLOPs<br/>If MaxFLOPs << PeakFLOPs: Memory Bound"]
     end
 
     ArithmeticIntensity --> Bottleneck
@@ -807,37 +856,37 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph CacheEvolution[KV Cache Evolution]
+    subgraph CacheEvolution["KV Cache Evolution"]
         direction LR
 
-        T0[Step 0<br>Prompt: S tokens]
-        T1[Step 1<br>S+1 tokens]
-        T2[Step 2<br>S+2 tokens]
-        TN[Step N<br>S+N tokens]
+        T0["Step 0<br/>Prompt: S tokens"]
+        T1["Step 1<br/>S+1 tokens"]
+        T2["Step 2<br/>S+2 tokens"]
+        TN["Step N<br/>S+N tokens"]
 
         T0 --> T1 --> T2 --> TN
 
-        subgraph Layout[Memory Layout]
-            Cont[Contiguous<br>Simple but inflexible]
-            Paged[Paged<br>Flexible with overhead]
-            Block[Blocked<br>Balance of both]
+        subgraph Layout["Memory Layout"]
+            Cont["Contiguous<br/>Simple but inflexible"]
+            Paged["Paged<br/>Flexible with overhead"]
+            Block["Blocked<br/>Balance of both"]
         end
 
         TN --> Layout
     end
 
-    subgraph Operations[Cache Operations per Step]
-        Read[Read K[0:t], V[0:t]<br>Size: 2×t×L×H×D_h]
-        Write[Write K[t], V[t]<br>Size: 2×L×H×D_h]
-        Total[Total: O(t) growth]
+    subgraph Operations["Cache Operations per Step"]
+        Read["Read K[0:t], V[0:t]<br/>Size: 2×t×L×H×D_h"]
+        Write["Write K[t], V[t]<br/>Size: 2×L×H×D_h"]
+        Total["Total: O(t) growth"]
     end
 
     CacheEvolution --> Operations
 
-    subgraph Optimization[Optimization Strategies]
-        FP8[FP8 Quantization<br>2× reduction]
-        Selective[Selective Caching<br>Cache only important layers]
-        Compression[Cache Compression<br>Lossy/lossless]
+    subgraph Optimization["Optimization Strategies"]
+        FP8["FP8 Quantization<br/>2× reduction"]
+        Selective["Selective Caching<br/>Cache only important layers"]
+        Compression["Cache Compression<br/>Lossy/lossless"]
     end
 
     Operations --> Optimization
@@ -850,51 +899,51 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph PagedAttention[PagedAttention System]
+    subgraph PagedAttention["PagedAttention System"]
         direction TB
 
-        subgraph Logical[Logical View]
-            Seq1[Sequence 1<br>Tokens: 0..T1]
-            Seq2[Sequence 2<br>Tokens: 0..T2]
-            Seq3[Sequence 3<br>Tokens: 0..T3]
+        subgraph Logical["Logical View"]
+            Seq1["Sequence 1<br/>Tokens: 0..T1"]
+            Seq2["Sequence 2<br/>Tokens: 0..T2"]
+            Seq3["Sequence 3<br/>Tokens: 0..T3"]
         end
 
-        subgraph Physical[Physical Memory Blocks]
-            Block0[Block 0<br>Size: B tokens]
-            Block1[Block 1]
-            Block2[Block 2]
-            BlockN[Block N]
+        subgraph Physical["Physical Memory Blocks"]
+            Block0["Block 0<br/>Size: B tokens"]
+            Block1["Block 1"]
+            Block2["Block 2"]
+            BlockN["Block N"]
         end
 
-        subgraph Mapping[Block Mapping Table]
-            T1Map[Seq1: Block0, Block1, Block3]
-            T2Map[Seq2: Block2, Block4]
-            T3Map[Seq3: Block5]
+        subgraph Mapping["Block Mapping Table"]
+            T1Map["Seq1: Block0, Block1, Block3"]
+            T2Map["Seq2: Block2, Block4"]
+            T3Map["Seq3: Block5"]
         end
 
         Logical --> Mapping --> Physical
 
-        subgraph Operations[Key Operations]
-            Alloc[Allocate Block<br>When current block full]
-            Free[Free Blocks<br>When sequence completes]
-            Defrag[Defragment<br>Optional compaction]
+        subgraph Operations["Key Operations"]
+            Alloc["Allocate Block<br/>When current block full"]
+            Free["Free Blocks<br/>When sequence completes"]
+            Defrag["Defragment<br/>Optional compaction"]
         end
 
         Physical --> Operations
     end
 
-    subgraph Benefits[Benefits]
-        Frag[Eliminates Fragmentation]
-        Share[Enables Sharing<br>Prefix sharing across sequences]
-        Dynamic[Dynamic Allocation]
+    subgraph Benefits["Benefits"]
+        Frag["Eliminates Fragmentation"]
+        Share["Enables Sharing<br/>Prefix sharing across sequences"]
+        Dynamic["Dynamic Allocation"]
     end
 
     PagedAttention --> Benefits
 
-    subgraph Overhead[Overhead]
-        Table[Mapping Table Overhead]
-        Indirect[Indirect Access Cost]
-        Complex[Increased Complexity]
+    subgraph Overhead["Overhead"]
+        Table["Mapping Table Overhead"]
+        Indirect["Indirect Access Cost"]
+        Complex["Increased Complexity"]
     end
 
     PagedAttention --> Overhead
@@ -907,48 +956,48 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph KernelFusion[Kernel Fusion for Decode]
+    subgraph KernelFusion["Kernel Fusion for Decode"]
         direction TB
 
-        subgraph Baseline[Baseline - Separate Kernels]
-            K1[Embedding]
-            K2[QKV Projection]
-            K3[Attention]
-            K4[Output Projection]
-            K5[FFN Layer 1]
-            K6[FFN Layer 2]
-            K7[LayerNorm]
+        subgraph Baseline["Baseline - Separate Kernels"]
+            K1["Embedding"]
+            K2["QKV Projection"]
+            K3["Attention"]
+            K4["Output Projection"]
+            K5["FFN Layer 1"]
+            K6["FFN Layer 2"]
+            K7["LayerNorm"]
         end
 
-        subgraph Fused[Fused Strategy]
-            F1[Fused QKV + Attention]
-            F2[Fused FFN Layers]
-            F3[Fused LayerNorm with residual]
+        subgraph Fused["Fused Strategy"]
+            F1["Fused QKV + Attention"]
+            F2["Fused FFN Layers"]
+            F3["Fused LayerNorm with residual"]
         end
 
         Baseline --> Fused
 
-        subgraph Benefits[Fusion Benefits]
-            Mem[Reduced Memory Traffic]
-            Launch[Fewer Kernel Launches]
-            Reg[Better Register Reuse]
+        subgraph Benefits["Fusion Benefits"]
+            Mem["Reduced Memory Traffic"]
+            Launch["Fewer Kernel Launches"]
+            Reg["Better Register Reuse"]
         end
 
         Fused --> Benefits
 
-        subgraph Challenges[Fusion Challenges]
-            Register[Register Pressure]
-            Complexity[Increased Code Complexity]
-            Maintenance[Harder to Maintain]
+        subgraph Challenges["Fusion Challenges"]
+            Register["Register Pressure"]
+            Complexity["Increased Code Complexity"]
+            Maintenance["Harder to Maintain"]
         end
 
         Fused --> Challenges
     end
 
-    subgraph RealExample[Real-World Example: xFormers]
-        MemoryEfficient[Memory Efficient Attention]
-        FlashDecode[Flash-Decode for long contexts]
-        BlockSparse[Block-Sparse Attention]
+    subgraph RealExample["Real-World Example: xFormers"]
+        MemoryEfficient["Memory Efficient Attention"]
+        FlashDecode["Flash-Decode for long contexts"]
+        BlockSparse["Block-Sparse Attention"]
     end
 
     KernelFusion --> RealExample
@@ -1374,43 +1423,43 @@ Let:
 
 ```mermaid
 flowchart TD
-    subgraph SchedulingSpace[Scheduling Algorithm Space]
+    subgraph SchedulingSpace["Scheduling Algorithm Space"]
         direction TB
 
-        subgraph Static[Static Batching]
-            Fixed[Fixed Batch Size]
-            Fill[Fill Until Full]
-            Wait[Wait for Timeout]
+        subgraph Static["Static Batching"]
+            Fixed["Fixed Batch Size"]
+            Fill["Fill Until Full"]
+            Wait["Wait for Timeout"]
         end
 
-        subgraph Dynamic[Dynamic Batching]
-            OR[Or-Recursive Batching]
-            Adaptive[Adaptive Batching]
-            LookAhead[Look-Ahead Scheduling]
+        subgraph Dynamic["Dynamic Batching"]
+            OR["Or-Recursive Batching"]
+            Adaptive["Adaptive Batching"]
+            LookAhead["Look-Ahead Scheduling"]
         end
 
-        subgraph Continuous[Continuous Batching]
-            Iter[Iteration-Level]
-            Chunk[Chunk-Aware]
-            Priority[Priority-Based]
+        subgraph Continuous["Continuous Batching"]
+            Iter["Iteration-Level"]
+            Chunk["Chunk-Aware"]
+            Priority["Priority-Based"]
         end
 
         Static --> Dynamic --> Continuous
     end
 
-    subgraph Metrics[Scheduling Metrics]
-        Tput[Throughput<br>Tokens/sec/GPU]
-        TTFT[Time-To-First-Token]
-        TPOT[Time-Per-Output-Token]
-        Fair[Fairness<br>Jain's Index]
+    subgraph Metrics["Scheduling Metrics"]
+        Tput["Throughput<br/>Tokens/sec/GPU"]
+        TTFT["Time-To-First-Token"]
+        TPOT["Time-Per-Output-Token"]
+        Fair["Fairness<br/>Jain's Index"]
     end
 
     SchedulingSpace --> Metrics
 
-    subgraph Algorithms[Specific Algorithms]
-        vLLM[vLLM Scheduler]
-        TGI[TGI Continuous Batching]
-        MII[MII Dynamic Batching]
+    subgraph Algorithms["Specific Algorithms"]
+        vLLM["vLLM Scheduler"]
+        TGI["TGI Continuous Batching"]
+        MII["MII Dynamic Batching"]
     end
 
     Continuous --> Algorithms
@@ -1459,52 +1508,52 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    subgraph MemoryMgmt[Memory Management in Scheduler]
+    subgraph MemoryMgmt["Memory Management in Scheduler"]
         direction TB
 
-        subgraph Allocation[Allocation Strategy]
-            FirstFit[First Fit]
-            BestFit[Best Fit]
-            Buddy[Buddy System]
-            Slab[Slab Allocation]
+        subgraph Allocation["Allocation Strategy"]
+            FirstFit["First Fit"]
+            BestFit["Best Fit"]
+            Buddy["Buddy System"]
+            Slab["Slab Allocation"]
         end
 
-        subgraph CacheMgmt[Cache Management]
-            LRU[LRU Eviction]
-            LFU[LFU Eviction]
-            ARC[Adaptive Replacement]
-            WorkingSet[Working Set Model]
+        subgraph CacheMgmt["Cache Management"]
+            LRU["LRU Eviction"]
+            LFU["LFU Eviction"]
+            ARC["Adaptive Replacement"]
+            WorkingSet["Working Set Model"]
         end
 
-        subgraph Sharing[Sharing Optimization]
-            Prefix[Prompt Prefix Sharing]
-            Layer[Layer-wise Sharing]
-            Head[Attention Head Sharing]
+        subgraph Sharing["Sharing Optimization"]
+            Prefix["Prompt Prefix Sharing"]
+            Layer["Layer-wise Sharing"]
+            Head["Attention Head Sharing"]
         end
 
         Allocation --> CacheMgmt --> Sharing
 
-        subgraph Policies[Management Policies]
-            Watermark[High/Low Watermark]
-            Prefetch[Prefetching]
-            Compression[On-demand Compression]
+        subgraph Policies["Management Policies"]
+            Watermark["High/Low Watermark"]
+            Prefetch["Prefetching"]
+            Compression["On-demand Compression"]
         end
 
         Sharing --> Policies
     end
 
-    subgraph Challenges[Memory Challenges]
-        Frag[Fragmentation]
-        Thrash[Thrashing]
-        Overhead[Management Overhead]
+    subgraph Challenges["Memory Challenges"]
+        Frag["Fragmentation"]
+        Thrash["Thrashing"]
+        Overhead["Management Overhead"]
     end
 
     MemoryMgmt --> Challenges
 
-    subgraph Solutions[Common Solutions]
-        Paged[Paged Attention]
-        Virtual[Virtual Memory]
-        Tiered[Tiered Storage]
+    subgraph Solutions["Common Solutions"]
+        Paged["Paged Attention"]
+        Virtual["Virtual Memory"]
+        Tiered["Tiered Storage"]
     end
 
     Challenges --> Solutions
@@ -1517,30 +1566,30 @@ flowchart TD
 
 ```mermaid
 graph TD
-    subgraph Tradeoffs[Scheduler Performance Trade-offs]
-        A[Small Batch Size] --> B[Low Latency]
-        A --> C[Low Utilization]
+    subgraph Tradeoffs["Scheduler Performance Trade-offs"]
+        A["Small Batch Size"] --> B["Low Latency"]
+        A --> C["Low Utilization"]
 
-        D[Large Batch Size] --> E[High Throughput]
-        D --> F[High Latency]
+        D["Large Batch Size"] --> E["High Throughput"]
+        D --> F["High Latency"]
 
-        G[Decode-First] --> H[Good TPOT]
-        G --> I[Poor TTFT]
+        G["Decode-First"] --> H["Good TPOT"]
+        G --> I["Poor TTFT"]
 
-        J[Prefill-First] --> K[Good TTFT]
-        J --> L[Poor TPOT]
+        J["Prefill-First"] --> K["Good TTFT"]
+        J --> L["Poor TPOT"]
 
-        M[Fixed Chunk Size] --> N[Predictable]
-        M --> O[Inefficient for Varied Lengths]
+        M["Fixed Chunk Size"] --> N["Predictable"]
+        M --> O["Inefficient for Varied Lengths"]
 
-        P[Dynamic Chunking] --> Q[Efficient]
-        P --> R[Complex]
+        P["Dynamic Chunking"] --> Q["Efficient"]
+        P --> R["Complex"]
     end
 
-    subgraph Optimal[Optimal Point]
-        S[Balance All Metrics]
-        T[Adapt to Workload]
-        U[Dynamic Adjustment]
+    subgraph Optimal["Optimal Point"]
+        S["Balance All Metrics"]
+        T["Adapt to Workload"]
+        U["Dynamic Adjustment"]
     end
 
     B & E & H & K & N & Q --> S
@@ -2068,51 +2117,51 @@ Where C_i ≤ C and Σ C_i = P.
 
 ```mermaid
 flowchart TD
-    subgraph Architecture[Chunked Prefill Architecture]
+    subgraph Architecture["Chunked Prefill Architecture"]
         direction TB
 
-        subgraph Input[Input Processing]
-            Prompt[Long Prompt]
-            Split[Chunk Splitter]
-            Chunks[Chunk1, Chunk2, ...]
+        subgraph Input["Input Processing"]
+            Prompt["Long Prompt"]
+            Split["Chunk Splitter"]
+            Chunks["Chunk1, Chunk2, ..."]
         end
 
-        subgraph Execution[Execution Engine]
-            Scheduler[Chunk Scheduler]
-            Executor[Chunk Executor]
-            CacheMgr[Cache Manager]
+        subgraph Execution["Execution Engine"]
+            Scheduler["Chunk Scheduler"]
+            Executor["Chunk Executor"]
+            CacheMgr["Cache Manager"]
         end
 
-        subgraph Output[Output Generation]
-            Cache[KV Cache]
-            Decoder[Decoder]
-            Stream[Token Stream]
+        subgraph Output["Output Generation"]
+            Cache["KV Cache"]
+            Decoder["Decoder"]
+            Stream["Token Stream"]
         end
 
         Input --> Execution --> Output
 
-        subgraph Policies[Scheduling Policies]
-            Fixed[Fixed Chunk Size]
-            Adaptive[Adaptive Chunking]
-            Priority[Priority-Aware]
+        subgraph Policies["Scheduling Policies"]
+            Fixed["Fixed Chunk Size"]
+            Adaptive["Adaptive Chunking"]
+            Priority["Priority-Aware"]
         end
 
         Scheduler --> Policies
     end
 
-    subgraph Tradeoffs[Trade-offs]
-        TTFTA[TTFT Impact]
-        TPOTA[TPOT Impact]
-        MemoryA[Memory Overhead]
-        ComplexityA[System Complexity]
+    subgraph Tradeoffs["Trade-offs"]
+        TTFTA["TTFT Impact"]
+        TPOTA["TPOT Impact"]
+        MemoryA["Memory Overhead"]
+        ComplexityA["System Complexity"]
     end
 
     Architecture --> Tradeoffs
 
-    subgraph Optimization[Optimization Techniques]
-        Overlap[Compute-IO Overlap]
-        Prefetch[Prefetching]
-        Spec[Speculative Execution]
+    subgraph Optimization["Optimization Techniques"]
+        Overlap["Compute-IO Overlap"]
+        Prefetch["Prefetching"]
+        Spec["Speculative Execution"]
     end
 
     Tradeoffs --> Optimization
@@ -2165,50 +2214,50 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    subgraph Memory[Memory Management]
+    subgraph Memory["Memory Management"]
         direction TB
 
-        subgraph Allocation[Chunk Allocation]
-            Cont[Contiguous Allocation]
-            Paged[Paged Allocation]
-            Hybrid[Hybrid Approach]
+        subgraph Allocation["Chunk Allocation"]
+            Cont["Contiguous Allocation"]
+            Paged["Paged Allocation"]
+            Hybrid["Hybrid Approach"]
         end
 
-        subgraph Cache[Cache Management]
-            Write[Write Strategy]
-            Merge[Merge Strategy]
-            Evict[Eviction Policy]
+        subgraph Cache["Cache Management"]
+            Write["Write Strategy"]
+            Merge["Merge Strategy"]
+            Evict["Eviction Policy"]
         end
 
-        subgraph Sharing[Sharing Opportunities]
-            Prefix[Prefix Sharing]
-            Layer[Partial Layer Sharing]
-            Head[Attention Head Sharing]
+        subgraph Sharing["Sharing Opportunities"]
+            Prefix["Prefix Sharing"]
+            Layer["Partial Layer Sharing"]
+            Head["Attention Head Sharing"]
         end
 
         Allocation --> Cache --> Sharing
 
-        subgraph Optimization[Optimizations]
-            Buffer[Double Buffering]
-            Prefetch[Smart Prefetch]
-            Compress[On-the-fly Compression]
+        subgraph Optimization["Optimizations"]
+            Buffer["Double Buffering"]
+            Prefetch["Smart Prefetch"]
+            Compress["On-the-fly Compression"]
         end
 
         Sharing --> Optimization
     end
 
-    subgraph Challenges[Challenges]
-        Frag[Fragmentation]
-        Overhead[Management Overhead]
-        Consistency[Cache Consistency]
+    subgraph Challenges["Challenges"]
+        Frag["Fragmentation"]
+        Overhead["Management Overhead"]
+        Consistency["Cache Consistency"]
     end
 
     Memory --> Challenges
 
-    subgraph Solutions[Solutions]
-        Virtual[Virtual Memory]
-        Copy[Copy-on-Write]
-        Version[Versioning]
+    subgraph Solutions["Solutions"]
+        Virtual["Virtual Memory"]
+        Copy["Copy-on-Write"]
+        Version["Versioning"]
     end
 
     Challenges --> Solutions
@@ -2221,26 +2270,26 @@ flowchart TD
 
 ```mermaid
 graph TD
-    subgraph Characteristics[Performance Characteristics]
-        A[Without Chunking] --> B[Long Prefill Blocking]
-        A --> C[High TTFT Variance]
-        A --> D[Poor TPOT for Others]
+    subgraph Characteristics["Performance Characteristics"]
+        A["Without Chunking"] --> B["Long Prefill Blocking"]
+        A --> C["High TTFT Variance"]
+        A --> D["Poor TPOT for Others"]
 
-        E[With Chunking] --> F[Smooth Prefill]
-        E --> G[Predictable TTFT]
-        E --> H[Good TPOT for All]
+        E["With Chunking"] --> F["Smooth Prefill"]
+        E --> G["Predictable TTFT"]
+        E --> H["Good TPOT for All"]
 
-        I[Small Chunks] --> J[Better Fairness]
-        I --> K[Higher Overhead]
+        I["Small Chunks"] --> J["Better Fairness"]
+        I --> K["Higher Overhead"]
 
-        L[Large Chunks] --> M[Lower Overhead]
-        L --> N[Less Fairness]
+        L["Large Chunks"] --> M["Lower Overhead"]
+        L --> N["Less Fairness"]
     end
 
-    subgraph Optimal[Optimal Point]
-        O[Adaptive Chunk Size]
-        P[Workload-Aware]
-        Q[Dynamic Adjustment]
+    subgraph Optimal["Optimal Point"]
+        O["Adaptive Chunk Size"]
+        P["Workload-Aware"]
+        Q["Dynamic Adjustment"]
     end
 
     F & G & H & J & M --> O
@@ -2632,34 +2681,34 @@ Total time = T_prefill(P) + T_decode(N) on same hardware
 
 ```mermaid
 flowchart TD
-    subgraph Architecture[Disaggregated Architecture]
+    subgraph Architecture["Disaggregated Architecture"]
         direction TB
 
-        subgraph Gateway[API Gateway]
-            LB[Load Balancer]
-            Router[Request Router]
-            Monitor[Health Monitor]
+        subgraph Gateway["API Gateway"]
+            LB["Load Balancer"]
+            Router["Request Router"]
+            Monitor["Health Monitor"]
         end
 
-        subgraph PrefillCluster[Prefill Cluster]
+        subgraph PrefillCluster["Prefill Cluster"]
             direction LR
-            P1[Prefill Node 1<br>H100/Compute]
-            P2[Prefill Node 2]
-            P3[Prefill Node 3]
+            P1["Prefill Node 1<br/>H100/Compute"]
+            P2["Prefill Node 2"]
+            P3["Prefill Node 3"]
         end
 
-        subgraph DecodeCluster[Decode Cluster]
+        subgraph DecodeCluster["Decode Cluster"]
             direction LR
-            D1[Decode Node 1<br>A100/Memory]
-            D2[Decode Node 2]
-            D3[Decode Node 3]
-            D4[Decode Node 4]
+            D1["Decode Node 1<br/>A100/Memory"]
+            D2["Decode Node 2"]
+            D3["Decode Node 3"]
+            D4["Decode Node 4"]
         end
 
-        subgraph Storage[Shared Storage]
-            CacheStore[(KV Cache Store)]
-            ModelStore[(Model Weights)]
-            ConfigStore[(Configuration)]
+        subgraph Storage["Shared Storage"]
+            CacheStore[("KV Cache Store")]
+            ModelStore[("Model Weights")]
+            ConfigStore[("Configuration")]
         end
 
         Gateway --> PrefillCluster
@@ -2667,10 +2716,10 @@ flowchart TD
         CacheStore --> DecodeCluster
         DecodeCluster --> Gateway
 
-        subgraph Control[Control Plane]
-            Scheduler[Global Scheduler]
-            Orchestrator[Orchestrator]
-            Autoscaler[Autoscaler]
+        subgraph Control["Control Plane"]
+            Scheduler["Global Scheduler"]
+            Orchestrator["Orchestrator"]
+            Autoscaler["Autoscaler"]
         end
 
         Gateway --> Control
@@ -2678,14 +2727,14 @@ flowchart TD
         Control --> DecodeCluster
     end
 
-    subgraph DataFlow[Data Flow]
-        Req[Request In]
-        Prefill[Prefill Execution]
-        CacheWrite[Cache Serialization]
-        Transfer[Network Transfer]
-        CacheRead[Cache Deserialization]
-        Decode[Decode Execution]
-        Resp[Response Out]
+    subgraph DataFlow["Data Flow"]
+        Req["Request In"]
+        Prefill["Prefill Execution"]
+        CacheWrite["Cache Serialization"]
+        Transfer["Network Transfer"]
+        CacheRead["Cache Deserialization"]
+        Decode["Decode Execution"]
+        Resp["Response Out"]
 
         Req --> Prefill --> CacheWrite --> Transfer --> CacheRead --> Decode --> Resp
     end
@@ -2734,34 +2783,34 @@ sequenceDiagram
 
 ```mermaid
 graph TD
-    subgraph Allocation[Resource Allocation Strategies]
-        Fixed[Fixed Allocation]
-        Dynamic[Dynamic Allocation]
-        Predictive[Predictive Allocation]
+    subgraph Allocation["Resource Allocation Strategies"]
+        Fixed["Fixed Allocation"]
+        Dynamic["Dynamic Allocation"]
+        Predictive["Predictive Allocation"]
 
-        Fixed --> FixedP[Fixed Ratio]
-        Fixed --> FixedS[Static Partitioning]
+        Fixed --> FixedP["Fixed Ratio"]
+        Fixed --> FixedS["Static Partitioning"]
 
-        Dynamic --> DynamicL[Load-Based]
-        Dynamic --> DynamicP[Priority-Based]
+        Dynamic --> DynamicL["Load-Based"]
+        Dynamic --> DynamicP["Priority-Based"]
 
-        Predictive --> PredictiveH[Historical]
-        Predictive --> PredictiveM[Machine Learning]
+        Predictive --> PredictiveH["Historical"]
+        Predictive --> PredictiveM["Machine Learning"]
     end
 
-    subgraph Metrics[Allocation Metrics]
-        Utilization[Utilization Rate]
-        Latency[End-to-End Latency]
-        Cost[Cost Efficiency]
-        Fairness[Fairness Index]
+    subgraph Metrics["Allocation Metrics"]
+        Utilization["Utilization Rate"]
+        Latency["End-to-End Latency"]
+        Cost["Cost Efficiency"]
+        Fairness["Fairness Index"]
     end
 
     Allocation --> Metrics
 
-    subgraph Optimization[Optimization Techniques]
-        BinPacking[Bin Packing]
-        LoadBalancing[Load Balancing]
-        AutoScaling[Auto Scaling]
+    subgraph Optimization["Optimization Techniques"]
+        BinPacking["Bin Packing"]
+        LoadBalancing["Load Balancing"]
+        AutoScaling["Auto Scaling"]
     end
 
     Metrics --> Optimization
