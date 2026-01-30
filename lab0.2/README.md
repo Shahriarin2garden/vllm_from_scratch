@@ -2,6 +2,8 @@
 
 Status: Not started
 
+**Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
+
 # **Lab 0.2: Prefill vs. Decode – The Two-Phase Engine**
 
 **A Comprehensive Guide to Autoregressive Inference, Scheduling, and Modern Optimizations**

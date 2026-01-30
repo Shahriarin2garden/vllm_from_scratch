@@ -1,6 +1,8 @@
-# lab 0.1\
+# lab 0.1
 
 Status: Not started
+
+**Navigation:** [← Main](../README.md) | [Next: Lab 0.2 →](../lab0.2/README.md)
 
 # Lab 0.1: From Text to Tensors – The Inference Computational Graph
 
@@ -961,7 +963,11 @@ class NanoVLLMEngine:
 
 ## **➡️ Looking Ahead to Lab 0.2**
 
-Now that you understand the **static data pipeline** and the **dynamic KV Cache**, the next question is: how does the engine manage the **two fundamentally different types of work** that flow through this pipeline? In **Lab 0.2: Prefill vs. Decode – The Two-Phase Engine**, we will dissect the compute-bound prefill phase and the memory-bound decode phase in detail, and see how the scheduler's **continuous batching** weaves them together to maximize GPU utilization.
+Now that you understand the **static data pipeline** and the **dynamic KV Cache**, the next question is: how does the engine manage the **two fundamentally different types of work** that flow through this pipeline? In **[Lab 0.2: Prefill vs. Decode – The Two-Phase Engine](../lab0.2/README.md)**, we will dissect the compute-bound prefill phase and the memory-bound decode phase in detail, and see how the scheduler's **continuous batching** weaves them together to maximize GPU utilization.
+
+---
+
+**Navigation:** [← Main](../README.md) | [Next: Lab 0.2 →](../lab0.2/README.md)
 
 > Foundational Insight: Everything in nano-vLLM and vLLM is designed to execute this simplified inference graph as efficiently as possible. The complexity lies not in the graph itself, but in the orchestration of thousands of instances of this graph running concurrently with shared, dynamically managed resources.
 > 

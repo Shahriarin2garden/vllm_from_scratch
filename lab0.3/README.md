@@ -2,6 +2,8 @@
 
 Status: Not started
 
+**Navigation:** [← Lab 0.2](../lab0.2/README.md) | [Main](../README.md)
+
 # **Lab 0.3: The Heart of the Matter – KV Cache & Attention**
 
 ## **📚 Lab Objective**
