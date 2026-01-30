@@ -25,23 +25,23 @@ A tokenizer's job is to efficiently compress text into a sequence of vocabulary 
 
 ```mermaid
 flowchart TD
-    A["Raw User Prompt<br/>'The capital of France is'"] --> B[Text Normalization];
-    B --> C[Subword Segmentation];
-    C --> D[Vocabulary ID Lookup];
+    A["Raw User Prompt<br/>'The capital of France is'"] --> B_Node[Text Normalization];
+    B_Node --> C_Node[Subword Segmentation];
+    C_Node --> D_Node[Vocabulary ID Lookup];
 
-    subgraph B [Normalization]
+    subgraph B_Subgraph [Normalization]
         B1[Lowercasing?]
         B2[Unicode Normalization<br/>NFKC/NFD]
         B3[Whitespace/Accent Handling]
     end
 
-    subgraph C [BPE Algorithm Applied]
+    subgraph C_Subgraph [BPE Algorithm Applied]
         C1["Find most frequent pair: 'Th' + 'e' -> 'The'"]
         C2["Merge 'cap' + 'ital' -> 'capital'"]
         C3["Remainder: 'of', 'France', 'is'"]
     end
 
-    subgraph D [Map to Indices]
+    subgraph D_Subgraph [Map to Indices]
         D1["'The' -> 1"]
         D2["'capital' -> 307"]
         D3["'of' -> 2647"]
@@ -49,12 +49,12 @@ flowchart TD
         D5["'is' -> 278"]
     end
 
-    D --> E["Output Tensor<br/>Shape: [seq_len=5]<br/>[1, 307, 2647, 310, 278]"];
+    D_Node --> E["Output Tensor<br/>Shape: [seq_len=5]<br/>[1, 307, 2647, 310, 278]"];
 
     style A fill:#4a5568
-    style B fill:#2d3748
-    style C fill:#2d3748
-    style D fill:#2d3748
+    style B_Node fill:#2d3748
+    style C_Node fill:#2d3748
+    style D_Node fill:#2d3748
     style E fill:#48bb78
 
 ```
@@ -457,9 +457,9 @@ total_cache = seq_len * cache_per_token / (1024**3)  # Convert to GB
 graph TD
     subgraph Cache_Sizing [KV Cache Memory Breakdown]
         direction LR
-        Input[Input Parameters] --> Formula[Cache Size Formula];
+        Input_Node[Input Parameters] --> Formula[Cache Size Formula];
 
-        subgraph Input [Model Configuration]
+        subgraph Input_Subgraph [Model Configuration]
             L["L = 32 layers"]
             H["H_kv = 8 heads"]
             Dh["D_h = 128 dim"]
@@ -488,7 +488,7 @@ graph TD
         Batch --> Conclusion["Conclusion: Cache dominates<br/>memory at scale"];
     end
 
-    style Input fill:#2d3748
+    style Input_Node fill:#2d3748
     style SeqLen fill:#805ad5
     style Batch fill:#f56565
     style Conclusion fill:#48bb78
