@@ -114,18 +114,18 @@ The tensor of token IDs is meaningless to the model's transformer layers. The em
 **Why This Matters**: The **embedding matrix** (e.g., 50,257 × 4096 for a small model) is a massive, static, read-only tensor. Efficient, high-bandwidth access to this memory is crucial for performance. During inference, this lookup is a pure, parallelizable memory operation.
 
 **Mathematical Formulation**:
-Given token IDs \( X \in \mathbb{Z}^{B \times S} \) and embedding matrix \( W \in \mathbb{R}^{V \times D} \), the embedding operation is:
+Given token IDs $X \in \mathbb{Z}^{B \times S}$ and embedding matrix $W \in \mathbb{R}^{V \times D}$, the embedding operation is:
 
-\[
+$$
 E = W[X] \in \mathbb{R}^{B \times S \times D}
-\]
+$$
 
-This is an indexing operation followed by a potential scaling factor \( \sqrt{D} \) for positional encoding compatibility.
+This is an indexing operation followed by a potential scaling factor $\sqrt{D}$ for positional encoding compatibility.
 
-\[
+$$
 X \in \mathbb{Z}^{B \times S},\; W \in \mathbb{R}^{V \times D}, \quad
 E = W[X] \in \mathbb{R}^{B \times S \times D}
-\]
+$$
 
 ### **1.3 The Complete Initial Pipeline**
 
@@ -322,19 +322,19 @@ flowchart TD
 **What is Cached?**: In every decoder layer, for every generated token, we store its **Key** and **Value** vectors. The **Query** is never cached because it is only needed for the immediate attention calculation. This cache grows linearly with sequence length and is the primary source of dynamic memory consumption during inference.
 
 **Mathematical Formulation**:
-For sequence length \( n \), hidden dimension \( d \), and batch size \( B \):
+For sequence length $n$, hidden dimension $d$, and batch size $B$:
 
-\[
+$$
 \text{Cache Size} = 2 \times B \times n \times d \times \text{dtype\_size}
-\]
+$$
 
-For multi-head attention with \( h \) heads:
+For multi-head attention with $h$ heads:
 
-\[
+$$
 \text{Cache Size} = 2 \times B \times n \times h \times d_h \times \text{dtype\_size}
-\]
+$$
 
-where \( d_h = d / h \).
+where $d_h = d / h$.
 
 ### **3.2. The Scalability Challenge & PagedAttention**
 
@@ -437,18 +437,18 @@ if len(self.free_blocks) < blocks_needed:
 
 The size of the KV Cache is a primary determinant of your batch size and throughput. Here's the precise calculation formula:
 
-For a single request with sequence length \( S \), using a model with:
+For a single request with sequence length $S$, using a model with:
 
-- \( L \) layers
-- \( H_{kv} \) key/value heads (may use GQA or MQA)
-- \( D_h \) head dimension
-- \( B \) bytes per parameter (2 for FP16, 1 for INT8)
+- $L$ layers
+- $H_{kv}$ key/value heads (may use GQA or MQA)
+- $D_h$ head dimension
+- $B$ bytes per parameter (2 for FP16, 1 for INT8)
 
 **Cache Size**:
 
-\[
+$$
 \text{Cache Size} = 2 \times S \times L \times H_{kv} \times D_h \times B
-\]
+$$
 
 **Example: Llama-3 8B (8.03B parameters)**:
 
