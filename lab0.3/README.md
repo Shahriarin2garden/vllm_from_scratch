@@ -36,7 +36,7 @@ For generating token t:
 
 ```
 
-**Complexity**: O(t²) operations per token → O(n³) for sequence of length n
+**Complexity**: O(t) operations per token → O(n²) for sequence of length n
 
 **The Attention Equation With Cache**:
 
@@ -386,6 +386,8 @@ class PagedKVCache:
 
     def allocate(self, seq_id: str, num_tokens: int) -> List[int]:
         """Allocate blocks for tokens, return physical block indices."""
+        if self.block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
         blocks_needed = ceil(num_tokens / self.block_size)
 
         if len(self.free_blocks) < blocks_needed:
@@ -421,7 +423,9 @@ class PagedKVCache:
         k_blocks = []
         v_blocks = []
 
-        for i in range(num_blocks_needed):
+for i in range(num_blocks_needed):
+            if i >= len(blocks):
+                raise IndexError(f"Block index {i} out of range for blocks list of length {len(blocks)}")
             block = blocks[i]
             # Slice this block's K and V
             tokens_in_block = min(self.block_size, context_len - i * self.block_size)

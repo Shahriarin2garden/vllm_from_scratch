@@ -474,7 +474,7 @@ Determine if prefill is compute-bound or memory-bound.
 
 ```
 Compute bound threshold = Peak FLOPs / Peak Bandwidth
-                        = 312 TFLOPs / 1.5 TB/s
+                        = 312×10^12 FLOPs / 1.5×10^12 bytes/s
                         = 208 FLOPs/Byte
 
 Prefill AI = sequence_length = 1024 FLOPs/Byte

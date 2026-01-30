@@ -114,19 +114,18 @@ The tensor of token IDs is meaningless to the model's transformer layers. The em
 **Why This Matters**: The **embedding matrix** (e.g., 50,257 × 4096 for a small model) is a massive, static, read-only tensor. Efficient, high-bandwidth access to this memory is crucial for performance. During inference, this lookup is a pure, parallelizable memory operation.
 
 **Mathematical Formulation**:
-Given token IDs
+Given token IDs \( X \in \mathbb{Z}^{B \times S} \) and embedding matrix \( W \in \mathbb{R}^{V \times D} \), the embedding operation is:
 
- \( X \in \mathbb{Z}^{B \times S} \) and embedding matrix
-
- \( W \in \mathbb{R}^{V \times D} \), the embedding operation is:
-`\[
+\[
 E = W[X] \in \mathbb{R}^{B \times S \times D}
-\]`
+\]
 
 This is an indexing operation followed by a potential scaling factor \( \sqrt{D} \) for positional encoding compatibility.
 
-$X \in \mathbb{Z}^{B \times S},\; W \in \mathbb{R}^{V \times D}, \quad
-E = W[X] \in \mathbb{R}^{B \times S \times D}$
+\[
+X \in \mathbb{Z}^{B \times S},\; W \in \mathbb{R}^{V \times D}, \quad
+E = W[X] \in \mathbb{R}^{B \times S \times D}
+\]
 
 ### **1.3 The Complete Initial Pipeline**
 
@@ -177,7 +176,9 @@ class TextToTensorPipeline:
         embeddings = self.embedding(input_ids)
 
         # 4. Apply positional encoding scaling
-        hidden_dim = embeddings.size(-1)
+hidden_dim = embeddings.size(-1)
+        if hidden_dim < 0:
+            raise ValueError(f"hidden_dim must be non-negative, got {hidden_dim}")
         embeddings = embeddings * (hidden_dim ** 0.5)
 
         return embeddings, attention_mask
@@ -321,15 +322,19 @@ flowchart TD
 **What is Cached?**: In every decoder layer, for every generated token, we store its **Key** and **Value** vectors. The **Query** is never cached because it is only needed for the immediate attention calculation. This cache grows linearly with sequence length and is the primary source of dynamic memory consumption during inference.
 
 **Mathematical Formulation**:
-$For sequence length \( n \), hidden dimension \( d \), and batch size \( B \):
+For sequence length \( n \), hidden dimension \( d \), and batch size \( B \):
+
 \[
 \text{Cache Size} = 2 \times B \times n \times d \times \text{dtype\_size}
 \]
+
 For multi-head attention with \( h \) heads:
+
 \[
 \text{Cache Size} = 2 \times B \times n \times h \times d_h \times \text{dtype\_size}
 \]
-where \( d_h = d / h \).$
+
+where \( d_h = d / h \).
 
 ### **3.2. The Scalability Challenge & PagedAttention**
 
@@ -392,12 +397,19 @@ class PagedKVCache:
 
     def allocate(self, request_id: str, seq_len: int) -> Optional[List[int]]:
         """Allocate blocks for a request."""
+        if self.block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
         blocks_needed = (seq_len + self.block_size - 1) // self.block_size
 
-        if len(self.free_blocks) < blocks_needed:
+if len(self.free_blocks) < blocks_needed:
             return None  # Out of memory
 
-        allocated = [self.free_blocks.popleft() for _ in range(blocks_needed)]
+        # Safe allocation with bounds checking
+        allocated = []
+        for _ in range(blocks_needed):
+            if not self.free_blocks:
+                raise RuntimeError("Insufficient free blocks during allocation")
+            allocated.append(self.free_blocks.popleft())
         self.block_tables[request_id] = allocated
 
         # Initialize blocks to zeros (or could copy from shared prefix)
@@ -432,7 +444,11 @@ For a single request with sequence length \( S \), using a model with:
 - \( D_h \) head dimension
 - \( B \) bytes per parameter (2 for FP16, 1 for INT8)
 
-**Cache Size** = \( 2 \times S \times L \times H_{kv} \times D_h \times B \)
+**Cache Size**:
+
+\[
+\text{Cache Size} = 2 \times S \times L \times H_{kv} \times D_h \times B
+\]
 
 **Example: Llama-3 8B (8.03B parameters)**:
 
@@ -448,7 +464,7 @@ dtype_bytes = 2  # FP16
 cache_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
 # = 2 * 32 * 8 * 128 * 2 = 131,072 bytes = 128 KB per token
 
-total_cache = seq_len * cache_per_token / (1024**3)  # Convert to GB
+total_cache = seq_len * cache_per_token / (1024**3)  # Convert to GB (1 GB = 1024^3 bytes)
 # = 2048 * 131,072 / (1024**3) ≈ 0.25 GB per request
 
 ```
@@ -893,8 +909,10 @@ class NanoVLLMEngine:
             # Get logits for last position
             token_logits = logits[i, -1] if logits.dim() == 3 else logits[i]
 
-            # Apply temperature
+# Apply temperature
             temperature = params.get('temperature', 1.0)
+            if temperature <= 0:
+                raise ValueError(f"temperature must be positive, got {temperature}")
             if temperature != 1.0:
                 token_logits = token_logits / temperature
 

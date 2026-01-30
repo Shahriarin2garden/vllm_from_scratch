@@ -458,8 +458,10 @@ def flash_attention_impl(Q, K, V, block_size=256):
             S_tile = torch.matmul(Q_tile, K_tile.transpose(-2, -1)) / math.sqrt(head_dim)
 
             # Update running statistics
-            M_new = torch.maximum(M[:, :, block_start:block_end], S_tile.max(dim=-1, keepdim=True).values)
-            exp_S = torch.exp(S_tile - M_new)
+M_new = torch.maximum(M[:, :, block_start:block_end], S_tile.max(dim=-1, keepdim=True).values)
+            # Numerical stability: clamp to prevent overflow
+            S_shifted = torch.clamp(S_tile - M_new, min=-50, max=50)
+            exp_S = torch.exp(S_shifted)
             P_tile = exp_S / (torch.exp(M[:, :, block_start:block_end] - M_new) * L[:, :, block_start:block_end].unsqueeze(-1) +
                             exp_S.sum(dim=-1, keepdim=True))
 
@@ -570,7 +572,7 @@ def _attn_fwd(
         # -- update output accumulator --
         # scale acc
         acc_scale = l_i / l_i_new * alpha
-        acc = acc * acccale[:, None]
+        acc = acc * acc_scale[:, None]
 
         # update acc
         v = tl.load(
@@ -1167,6 +1169,8 @@ class PagedAttentionDecoder:
             block_table = block_tables[seq_idx]
 
             # Gather KV cache for this sequence
+            if self.block_size <= 0:
+                raise ValueError(f"block_size must be positive, got {self.block_size}")
             kv_blocks_needed = (seq_len + self.block_size - 1) // self.block_size
 
             # Prepare to gather all K, V for this sequence
@@ -2377,6 +2381,9 @@ class ChunkedPrefillExecutor:
         else:
             chunk_size = self.chunk_size
 
+if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        
         # Split into chunks
         for start in range(0, prompt_len, chunk_size):
             end = min(start + chunk_size, prompt_len)
