@@ -8,13 +8,35 @@ Status: Not started
 
 **A Comprehensive Guide to Autoregressive Inference, Scheduling, and Modern Optimizations**
 
+### **Conceptual Overview: The "Read" and "Write" of AI**
+Before diving into the complex architecture diagram and mathematical formulas, let's establish a high-level intuition. LLM inference isn't a single uniform process; it's split into two physically distinct phases that behave very differently on hardware:
+
+1.  **Prefill (The "Reading" Phase)**
+    *   **Analogy:** Imagine a student reading an exam question. They read the whole paragraph at once to build context.
+    *   **Technical Reality:** The GPU receives the user's entire prompt (e.g., 500 tokens) simultaneously. It processes these in parallel using massive matrix multiplications. This phase is efficient and uses the GPU's compute cores heavily ("Compute-Bound").
+
+2.  **Decode (The "Writing" Phase)**
+    *   **Analogy:** The student writes the answer one word at a time. They cannot write the 10th word before deciding on the 9th.
+    *   **Technical Reality:** The model generates one token at a time. Because the next token depends on the previous one, this process is strictly sequential. The GPU spends most of its time waiting for data to move from memory rather than computing ("Memory-Bound").
+
+### **Navigating the Architecture Diagram**
+The diagram below is a map of this two-phase engine. Key elements to focus on:
+*   **The Prompt Entry:** Represents the Prefill phase inputs.
+*   **The Recursion Loop:** Represents the Decode phase, where the output loops back to become the new input.
+*   **KV Cache:** The "short-term memory" block. This prevents the model from having to re-read the prompt for every single new word it generates.
+
 ![architecture_02](architecture_02)
 
 ## **1. Introduction: The Heartbeat of LLM Inference**
 
 ### **1.1 The Autoregressive Loop: Mathematical Foundation**
 
-The core of LLM inference is the **autoregressive generation process**, defined by the probability chain rule:
+The core of LLM inference is the **autoregressive generation process**.
+
+**Concept Intuition:**
+"Autoregressive" simply means "self-referencing". The model predicts the next word based on its own previous predictions. It's like a chain reaction where the output of step 1 becomes the input for step 2. You cannot skip ahead because step 10 requires specific knowledge of step 9.
+
+Mathematically, this is defined by the probability chain rule:
 
 ```
 P(w₁, w₂, ..., w_T) = Π P(w_t | w₁, w₂, ..., w_{t-1})
@@ -37,6 +59,9 @@ For GPT-3 (175B parameters) generating 100 tokens:
 > **Research Reference**: "Attention Is All You Need" (Vaswani et al., 2017) - The foundational paper that introduced the Transformer architecture and autoregressive generation.
 
 ### **1.2 Computational Graph Decomposition**
+
+**Concept Intuition:**
+This formula describes exactly what happens inside a single layer of the model for one specific moment in time ($t$). It says: "To calculate the current state ($h_t$), I need the previous state ($h_{t-1}$) plus specific memories (Keys and Values) from everything that happened in the past ($K_{1:t-1}, V_{1:t-1}$)."
 
 The forward pass of a Transformer layer for token generation can be represented as:
 
@@ -123,7 +148,15 @@ flowchart TD
 
 ```
 
-*Diagram 1.1: From Mathematical Model to System Architecture.* This diagram shows the progression from the fundamental probability chain rule to the computational decomposition, leading to the practical two-phase system architecture and its hardware mapping.
+*Diagram 1.1: From Mathematical Model to System Architecture.*
+
+**Detailed Explanation for Researchers:**
+This diagram bridges the gap between theoretical probability and physical silicon.
+1.  **Mathematical Dependency:** The "Chain Rule" creates a strict temporal dependency. We cannot compute $P(w_5)$ until $w_4$ is effectively sampled (argmax). This forces the sequential loop.
+2.  **Computational Split:** The diagram bifurcates the workload into:
+    *   **Prefill:** $P(w_{1:S} | \text{prompt})$ is computed all at once using causal masking. This allows dense matrix multiplications ($S \times S$), maximizing Tensor Core utilization ($O(S^2)$ parallel work).
+    *   **Decode:** $P(w_{t} | w_{1:t-1})$ is computed one by one. This reduces the problem to Matrix-Vector multiplication ($1 \times N$), which is severely memory bandwidth limited.
+3.  **Hardware Implications:** The CPU handles the complex control logic (scheduling), while the GPU is treated differently in phrases: as a parallel throughput engine during Prefill, and a latency-sensitive sequential engine during Decode. The VRAM acts as the state carrier (KV Cache) bridging these two distinct operational modes.
 
 ### **1.4 The Evolution of Inference Systems**
 
@@ -170,7 +203,17 @@ flowchart TD
 
 ```
 
-*Diagram 1.3: Complete System Stack.* This diagram shows the complete software and hardware stack of a modern LLM inference system, from API layer down to hardware components.
+*Diagram 1.3: Complete System Stack.*
+
+**Detailed Explanation for Researchers:**
+This stack represents the "vLLM-style" architecture that has become standard since 2023.
+*   **Software Layer:**
+    *   **Scheduler:** Unlike traditional HTTP servers, this scheduler is *iteration-level* aware. It doesn't just queue requests; it injects new requests into running batches (Continuous Batching) at every forward pass boundary.
+    *   **Memory Manager:** The critical innovation here is **PagedAttention** (mapping logical tokens to non-contiguous physical blocks), which virtually eliminates external memory fragmentation.
+    *   **Kernel Optimizer:** Custom CUDA kernels (like FlashAttention) are required because standard PyTorch implementations are too slow due to excessive HBM read/writes.
+*   **Hardware Layer:**
+    *   **HBM vs. Compute:** The diagram implicitly highlights the bottleneck. The connection between HBM and SM (Streaming Multiprocessors) is the limiting factor for decoding (Bandwidth), while the Tensor Cores are the limiting factor for prefill (Compute).
+    *   **Throughput vs. Latency:** The system optimizes logic (Softmax, Sampling) on FP32 units/CPU, while heavy lifting (MatMul) stays on Tensor Cores.
 
 ### **1.6 The Inference Pipeline**
 
@@ -206,6 +249,14 @@ flowchart LR
 
 ### **2.1 Mathematical Foundations of Attention**
 
+**Concept Intuition:**
+"Attention" is how the model connects words to each other. In the sentence "The bank of the river," the word "bank" needs to attend to "river" to know it's not a financial bank. 
+Mathematically, this uses three vectors:
+*   **Query (Q):** What I am looking for (e.g., current word).
+*   **Key (K):** What I contain (e.g., potential definitions).
+*   **Value (V):** What I actually mean.
+The dot product $QK^T$ measures "compatibility" or relevance between words.
+
 The attention mechanism computes:
 
 ```
@@ -220,6 +271,10 @@ Where for prompt length S:
 
 ### **2.2 FLOPs Analysis**
 
+**Concept Intuition:**
+FLOPs (Floating Point Operations) measure how much "math work" the hardware has to do.
+In the Prefill phase, the work grows mostly linearly with the size of the model ($N$) and the length of the prompt ($S$). However, the "attention" part has a quadratic term ($S \times S$), meaning if you double the prompt length, the attention work quadruples. This is why very long prompts become slow.
+
 For a model with N parameters processing prompt length S:
 
 ```
@@ -230,6 +285,13 @@ Total FLOPs ≈ 2 × N × S × (1 + S/d_model)
 The `S/d_model` term represents the quadratic attention cost.
 
 ### **2.3 Memory Hierarchy During Prefill**
+
+**Concept Intuition:**
+Think of the GPU memory system like a kitchen:
+*   **HBM (High Bandwidth Memory):** The pantry. Huge storage (40-80GB), but far away.
+*   **L2/L1 Cache:** The countertop. Small, but close and fast.
+*   **Registers:** The cutting board. Right in front of the chef (the processor).
+During Prefill, because we are processing so much data at once, the main challenge is keeping the "cutting board" busy without waiting for trips to the "pantry".
 
 ```mermaid
 flowchart TD
@@ -264,7 +326,14 @@ flowchart TD
 
 ```
 
-*Diagram 2.1: GPU Memory Hierarchy During Prefill.* This diagram shows how data flows through the GPU memory hierarchy during prefill, highlighting the movement from HBM to tensor cores.
+*Diagram 2.1: GPU Memory Hierarchy During Prefill.*
+
+**Detailed Explanation for Researchers:**
+This diagram illustrates why the Prefill phase is "Compute-Bound" and generally preferred by hardware.
+*   **Data Reuse:** In the prefill phase, we load model weights ($W$) from HBM once and reuse them for $S$ tokens (where $S$ is the sequence length, often > 1000).
+*   **Arithmetic Intensity:** The arithmetic intensity is approximately $S$. Since typical GPUs have a generic "Ops:Byte" ratio of ~100:1, as long as $S > 100$, we are fully utilizing the Tensor Cores.
+*   **SRAM (L1) Efficiency:** FlashAttention (and similar kernels) works by tiling the $Q, K, V$ matrices into keeping them in the fast L1/SRAM cache. This prevents the `Memory` block from becoming the bottleneck, allowing the `SM` (Streaming Multiprocessor) to run at near 100% utilization.
+*   **Contrast with Decode:** In the Decode phase (discussed later), $S=1$. This collapses the reuse factor, making the HBM link the bottleneck instead of the SMs.
 
 ### **2.4 Attention Computation Patterns**
 
@@ -806,6 +875,11 @@ class TRTLLMExecutor:
 
 ### **3.1 Mathematical Model of Decode**
 
+**Concept Intuition:**
+During decode, we are generating just *one* token.
+However, to generate this one token, we still need to pay attention to *everything* that came before it. This means we take our current single query ($q_t$) and check it against the entire history of Keys and Values ($K_{1:t}, V_{1:t}$).
+This is why the KV cache grows larger with every step, and why generating the 1000th token is slower/heavier than generating the 1st token.
+
 For decode step t, we compute:
 
 ```
@@ -817,6 +891,12 @@ Attention(q_t, K_{1:t}, V_{1:t}) = softmax(q_t K_{1:t}^T/√d_k) V_{1:t}
 The complexity is O(t × d_model) per step, or O(N²) total for N tokens.
 
 ### **3.2 Memory Access Pattern Analysis**
+
+**Concept Intuition:**
+This is the most critical bottleneck in LLM inference.
+Imagine you have a massive library (the model weights, ~some GBs).
+To write just *one word*, you have to walk through every aisle of the library and look at every book. You do very little actual reading (computation), but you do a ton of walking (memory transfer).
+The diagram below compares the "walking" (HBM Access) vs the "reading" (Compute). The ratio called "Arithmetic Intensity" is very low, meaning the hardware spends most of its time waiting for data to arrive.
 
 ```mermaid
 flowchart TD
@@ -854,7 +934,14 @@ flowchart TD
 
 ```
 
-*Diagram 3.1: Memory Access Pattern Analysis.* This diagram analyzes the memory access patterns during decode, showing why it's memory-bound.
+*Diagram 3.1: Memory Access Pattern Analysis.*
+
+**Detailed Explanation for Researchers:**
+This diagram provides the mathematical justification for why Batch size > 1 is strictly necessary during decode.
+*   **The Problem (AI < 1):** Arithmetic Intensity (AI) is the ratio of "Math Ops" to "Bytes Moved". In a naive loop (Batch Size=1), we load the entire model ($2N$ bytes, e.g., 140GB for Llama-70B) just to perform a tiny matrix-vector multiplication. The AI is effectively $\approx 1$, which is atrociously low compared to the GPU's capability (A100 peak AI is >100).
+*   **The Bandwidth Wall:** Modern GPUs (like H100) have ~3TB/s bandwidth but ~1000 TFLOPS compute. If your algorithm's AI is low, you hit the "Bandwidth Wall" and the Compute units sit idle 99% of the time.
+*   **The Solution:** By increasing batch size (e.g., to 128), we load the weights *once* and apply them to 128 tokens. This increases the operational intensity by 128x, moving us from the "Memory Bound" region towards the "Compute Bound" region.
+*   **KV Cache Cost:** Note that while weights are reused, KV Cache is *unique* per sequence. This introduces a secondary bandwidth wall that grows with sequence length ($t$).
 
 ### **3.3 KV Cache Evolution During Decode**
 
@@ -954,7 +1041,14 @@ flowchart TD
 
 ```
 
-*Diagram 3.3: PagedAttention Memory Management.* This diagram shows how PagedAttention maps logical sequences to physical memory blocks.
+*Diagram 3.3: PagedAttention Memory Management.*
+
+**Detailed Explanation for Researchers:**
+PagedAttention is the defining feature of vLLM, solving the "Memory Fragmentation" problem that plagued early systems (like FasterTransformer).
+*   **The Problem (Contiguous Memory):** Early systems pre-allocated contiguous VRAM for the maximum possible sequence length (e.g., 2048 tokens). If a user stopped after 50 tokens, 1998 slots were wasted ("Internal Fragmentation"). If the system couldn't find a contiguous block big enough, the request failed ("External Fragmentation").
+*   **The OS Inspiration:** Just as Virtual Memory allows an OS to store a continuous program in scattered physical RAM pages, PagedAttention stores a continuous logical conversation in scattered VRAM blocks.
+*   **Block Table:** The "Mapping" section in the diagram is a lookup table (similar to a Page Table) that translates `(RequestID, LogicalTokenIndex)` -> `(PhysicalBlockID, Offset)`.
+*   **Copy-on-Write (Prefix Sharing):** A secondary benefit (not fully shown but implied by the "Share" node) is efficient beam search or system prompt handling. If two requests start with the same system prompt, they can point to the same physical blocks for those initial tokens, saving GBs of VRAM.
 
 ### **3.5 Decode Kernel Fusion Strategies**
 
@@ -1008,9 +1102,22 @@ flowchart TD
 
 ```
 
-*Diagram 3.4: Decode Kernel Fusion.* This diagram shows kernel fusion strategies to reduce memory traffic during decode.
+*Diagram 3.4: Decode Kernel Fusion.*
+
+**Detailed Explanation for Researchers:**
+In memory-bound applications like LLM decoding, "Kernel Fusion" is not just an optimization; it is a necessity for reasonable latency.
+*   **The Problem:** Every time a kernel (GPU function) finishes, it writes its result to HBM. The next kernel reads it back. For an operation like `x = x + a; y = x * b`, running two kernels means writing `x` to memory and reading it back, wasting bandwidth.
+*   **The Solution:** Kernel Fusion combines multiple mathematical operations into a single CUDA kernel. The intermediate values stay in the fast Registry/SRAM and are never written to global memory.
+*   **Key Fusions in LLMs:**
+    *   **QKV + Rotary Embedding:** Instead of calculating Q, K, V separately and then applying rotations, we do it all in one go.
+    *   **LayerNorm + Residual:** Standard PyTorch implements these as two calls; fused kernels do them together.
+    *   **Flash-Decoding:** This is the ultimate fusion for the Attention block itself, dealing with the difficulty of parallelizing the softmax operation across thread blocks.
 
 ### **3.6 Implementation: Optimized Decode Phase**
+
+**Code Explanation for Researchers:**
+This snippet represents the "Naive" baseline. It clearly demonstrates the limitation: the loop runs in Python, and for every single token, we invoke the full weight matrix of the model.
+Notice the `kv_cache` argument. In a naive implementation, this grows linearly. In an optimized one (like vLLM), this would be replaced by a `BlockTable` pointer.
 
 **3.6.1 Basic Decode Step Implementation**
 
@@ -1418,6 +1525,11 @@ class FlashDecodeAttention:
 
 ### **4.1 Mathematical Formulation of Scheduling Problem**
 
+**Concept Intuition:**
+The scheduler is the traffic controller. It has a lineup of cars (requests) of different lengths (prompt size) and different destinations (output length).
+Its job is to pack as many cars onto the highway (the GPU) as possible without causing a crash (OOM) or a traffic jam (high latency).
+The core tension is that "Prefill" cars are huge semi-trucks that block the road, while "Decode" cars are small motorbikes that zip by but require constant attention.
+
 Let:
 
 - R = set of requests
@@ -1426,6 +1538,12 @@ Let:
 - Objective: Maximize throughput while respecting latency constraints
 
 ### **4.2 Scheduling Algorithm Space**
+
+**Concept Intuition:**
+We have evolved three ways to manage this traffic:
+1.  **Static:** Wait for a bus to fill up before leaving. (Bad latency for first passenger).
+2.  **Dynamic:** Send small vans as soon as they have a few people. (Better).
+3.  **Continuous:** Allow new passengers to jump onto a moving train at any stop. (Best, used in vLLM).
 
 ```mermaid
 flowchart TD
@@ -1508,7 +1626,13 @@ stateDiagram-v2
 
 ```
 
-*Diagram 4.2: Continuous Batching State Machine.* This diagram shows the state machine for requests in continuous batching.
+*Diagram 4.2: Continuous Batching State Machine.*
+
+**Detailed Explanation for Researchers:**
+This diagram maps the lifecycle of a request in a system like vLLM or Orca.
+*   **The Paradigm Shift:** In traditional batching, a request is either "waiting" or "running". In Continuous Batching, the "running" state is fluid. A request can participate in the batch for one token generation step, be paused (swapped out to CPU RAM) if VRAM is tight, and then return.
+*   **The "Chunking" Sub-state:** Notice the `Prefill` state has a `Chunking` loop. This is critical for preventing "Head-of-Line Blocking". If a massive prompt arrives, we don't block the `Decoding` loop for 500ms. We process 50ms of the prompt, then let the `Decoding` requests run one step, then process another 50ms.
+*   **Preemption:** The `Decoding -> Paused` transition is the safety valve. If the KV Cache grows too large (because all sequences generated long outputs), the scheduler actively evicts the lowest priority request to CPU RAM to prevent an OOM crash for the others.
 
 ### **4.4 Memory Management in Scheduling**
 
@@ -1605,6 +1729,11 @@ graph TD
 *Diagram 4.4: Scheduler Performance Trade-offs.* This diagram visualizes the trade-offs between different scheduling decisions.
 
 ### **4.6 Implementation: Advanced Scheduling Systems**
+
+**Code Explanation for Researchers:**
+This pseudocode distills the logic of the actual vLLM scheduler.
+*   **Separation of Concerns:** Notice `BlockSpaceManager` vs `Policy`. The manager handles the *mechanism* (can I fit this?), while the policy handles the *strategy* (should I pick this?).
+*   **The Main Loop:** The `schedule()` method is called *every iteration*. It doesn't plan far ahead; it reacts to the current state of the memory pool. This "Just-In-Time" scheduling is key to handling the unpredictable output lengths of LLMs.
 
 **4.6.1 vLLM Scheduler Implementation**
 
@@ -2109,6 +2238,11 @@ class QoScheduler:
 
 ### **5.1 Mathematical Model of Chunked Prefill**
 
+**Concept Intuition:**
+"Chunking" solves the "semi-truck" problem mentioned earlier.
+If a prompt is huge (e.g., 100k tokens), processing it all at once (Prefill) would freeze the GPU for seconds, blocking all the little "motorbike" (Decode) requests.
+Chunked prefill breaks the huge prompt into bite-sized pieces. It processes one piece, then lets some decode requests run, then processes another piece. It interleaves the heavy lifting with the light work.
+
 For prompt length P, chunk size C:
 
 ```
@@ -2174,7 +2308,13 @@ flowchart TD
 
 ```
 
-*Diagram 5.1: Chunked Prefill Architecture.* This diagram shows the complete architecture for chunked prefill.
+*Diagram 5.1: Chunked Prefill Architecture.*
+
+**Detailed Explanation for Researchers:**
+Chunked Prefill (also known as "Piggybacking" or "Sarathi" style scheduling) addresses the specific pathology of "Long Prompt + Short Output" requests causing latency spikes.
+*   **The Artifact:** Without chunking, a generic 500ms prefill job is an atomic unit. If it starts, no other request can generate a token for 500ms. This ruins the P99 latency stats (Inter-Token Latency) for all concurrent users.
+*   **The Mechanism:** The Architecture splits the prompt processing loop. Instead of `for i in 0..PromptLen`, it becomes `for i in 0..ChunkSize..PromptLen`.
+*   **The State Complexity:** The main research challenge is managing the `KV Cache` state. Intermediate KV/Activation states must be persisted correctly between chunks without recomputing, essentially treating a "Prefill" as a "Macro-Decode" step. This requires careful alignment with the PagedAttention Block tables.
 
 ### **5.3 Chunk Scheduling Strategies**
 
@@ -2666,6 +2806,10 @@ class TRTLLMChunkedPrefill:
 
 ### **6.1 Mathematical Model of Disaggregation**
 
+**Concept Intuition:**
+Since Prefill is "Compute-Bound" and Decode is "Memory-Bound", using the same hardware for both is inefficient. It's like using a Ferrari (fast but small trunk) to move furniture, or a Dump Truck (big but slow) to race.
+Disaggregation uses "Dump Trucks" (Compute-optimized GPUs) for Prefill and "Ferraris" (Memory-bandwidth optimized GPUs) for Decode, transferring the data (KV Cache) between them.
+
 Let:
 
 - T_prefill(P) = time to prefill prompt length P
@@ -2752,7 +2896,15 @@ flowchart TD
 
 ```
 
-*Diagram 6.1: Disaggregated Architecture.* This diagram shows the complete disaggregated architecture with separate prefill and decode clusters.
+*Diagram 6.1: Disaggregated Architecture.*
+
+**Detailed Explanation for Researchers:**
+Disaggregation (Splitwise/TetriSched) represents the frontier of inference system design (2024+).
+*   **Hardware Specialization:**
+    *   **Prefill Nodes:** These require massive Compute (FLOPs) but less Memory Bandwidth relative to the math. H100s or even older A100s are good here, configured solely to crunch the prompt.
+    *   **Decode Nodes:** These are Memory-Bound. We want massive High Bandwidth Memory (HBM) capacity and speed, but we don't need as many Tensor Cores.
+*   **The Network Bottleneck:** The critical challenge (represented by the arrows to "KV Cache Store") is transferring the KV Cache from Prefill Node to Decode Node. A 1000-token prompt generates MBs of KV cache. Transferring this over PCIe/Network must be faster than just recomputing it, or the architecture fails.
+*   **KV-Cache Offloading**: In state-of-the-art implementations, the "KV Cache Store" is not a disk but a high-speed RdDMA (Remote Direct Memory Access) transfer directly between GPU memories over InfiniBand.
 
 ### **6.3 Cache Transfer Protocol**
 
