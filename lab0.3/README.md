@@ -76,35 +76,23 @@ For generating token t:
 
 ```mermaid
 graph TD
-    subgraph NO["WITHOUT KV CACHE - O(n²)"]
-        NC1["Token 1<br/>Process 1 token<br/>Ops: 1"] --> NC2["Token 2<br/>Reprocess: 1,2<br/>Ops: 2"]
-        NC2 --> NC3["Token 3<br/>Reprocess: 1,2,3<br/>Ops: 3"]
-        NC3 --> NC4["..."]
-        NC4 --> NC5["Token n<br/>Reprocess all<br/>Ops: n"]
-    end
+    NC1[Token 1: Process 1 token] --> NC2[Token 2: Re-process 2 tokens]
+    NC2 --> NC3[Token 3: Re-process 3 tokens]
+    NC3 --> NC4[...]
+    NC4 --> NC5[Token n: Re-process n tokens]
     
-    subgraph YES["WITH KV CACHE - O(n)"]
-        WC1["Token 1<br/>Process & Cache<br/>Ops: 1"] --> WC2["Token 2<br/>Use cache + new<br/>Ops: 1"]
-        WC2 --> WC3["Token 3<br/>Use cache + new<br/>Ops: 1"]
-        WC3 --> WC4["..."]
-        WC4 --> WC5["Token n<br/>Use cache + new<br/>Ops: 1"]
-    end
+    WC1[Token 1: Process & Cache] --> WC2[Token 2: Read cache + 1 new]
+    WC2 --> WC3[Token 3: Read cache + 1 new]
+    WC3 --> WC4[...]
+    WC4 --> WC5[Token n: Read cache + 1 new]
     
-    NC5 -->|"n=1000<br/>~500K ops"| Result1["PROHIBITIVE<br/>Too Slow for Serving"]
-    WC5 -->|"n=1000<br/>~1K ops"| Result2["PRACTICAL<br/>Enable Real-time"]
+    NC5 -->|n=1000 → ~500k ops| Result1[Prohibitive for Serving]
+    WC5 -->|n=1000 → ~1k ops| Result2[Practical for Real-time]
     
-    style NO fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#1a1a1a
-    style YES fill:#e0f2f1,stroke:#00796b,stroke-width:3px,color:#1a1a1a
-    style NC1 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style NC2 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style NC3 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style NC5 fill:#c2185b,color:#ffffff,stroke:#880e4f,stroke-width:3px
-    style WC1 fill:#b2dfdb,stroke:#004d40,stroke-width:2px,color:#1a1a1a
-    style WC2 fill:#b2dfdb,stroke:#004d40,stroke-width:2px,color:#1a1a1a
-    style WC3 fill:#b2dfdb,stroke:#004d40,stroke-width:2px,color:#1a1a1a
-    style WC5 fill:#00796b,color:#ffffff,stroke:#004d40,stroke-width:3px
-    style Result1 fill:#c2185b,color:#ffffff,stroke:#880e4f,stroke-width:3px
-    style Result2 fill:#00796b,color:#ffffff,stroke:#004d40,stroke-width:3px
+    style NC5 fill:#fca5a5
+    style WC2 fill:#bbf7d0
+    style WC3 fill:#bbf7d0
+    style WC5 fill:#bbf7d0
 ```
 
 ### **Step 1.2: Naive Implementation - Contiguous Cache**
@@ -152,24 +140,22 @@ class NaiveKVCache:
 *   **Why `MaxSeqLen`?** We are forced to guess `MaxSeqLen` upfront because standard tensor operations require contiguous memory. We can't easily resize a tensor in the middle of a CUDA kernel without expensive memory copies.
 
 ```mermaid
-graph TD
-    subgraph VRAM["GPU VRAM Layout - 4K Tokens Per Sequence"]
-        A1["Sequence A<br/>Allocated: 4K slots<br/>Actual: 512 tokens<br/>Wasted: 3.5K"]
-        A2["Sequence B<br/>Allocated: 4K slots<br/>Actual: 128 tokens<br/>Wasted: 3.9K"]
-        A3["Sequence C<br/>Allocated: 4K slots<br/>Actual: 2K tokens<br/>Wasted: 2K"]
-        A4["97 more sequences...<br/>Allocated: 388K slots<br/>No space for new requests"]
-    end
+graph LR
+    A1[Seq A: 4K slots<br/>Actual: 512 tokens] --> A2[Seq B: 4K slots<br/>Actual: 128 tokens]
+    A2 --> A3[Seq C: 4K slots<br/>Actual: 2K tokens]
+    A3 --> A4[... 100s more ...]
     
-    METRICS["MEMORY CRISIS<br/>Allocated: 400K slots<br/>Used: 50K tokens<br/>Available GPU RAM: 0GB<br/>Internal Fragmentation: 87.5%"]
+    U1[Actually Used: 6GB] --> U2[512 + 128 + 2K tokens]
     
-    A1 --> A2 --> A3 --> A4 --> METRICS
+    F1[Free: 0GB<br/>No space for new requests<br/>Despite apparent waste]
     
-    style VRAM fill:#fff3e0,stroke:#ef6c00,stroke-width:3px,color:#1a1a1a
-    style A1 fill:#ffccbc,stroke:#d84315,stroke-width:2px,color:#1a1a1a
-    style A2 fill:#ffccbc,stroke:#d84315,stroke-width:2px,color:#1a1a1a
-    style A3 fill:#ffccbc,stroke:#d84315,stroke-width:2px,color:#1a1a1a
-    style A4 fill:#ff7043,stroke:#bf360c,stroke-width:3px,color:#ffffff
-    style METRICS fill:#c2185b,color:#ffffff,stroke:#880e4f,stroke-width:3px
+    A4 --> Summary[18GB Wasted<br/>75% Fragmentation]
+    
+    style A1 fill:#fca5a5
+    style A2 fill:#fca5a5
+    style A3 fill:#fca5a5
+    style U1 fill:#bbf7d0
+    style F1 fill:#ef4444
 ```
 
 **Key Insight**: This is **internal fragmentation** - memory allocated but unused within each allocation.
@@ -232,36 +218,21 @@ class DynamicKVCache:
 
 ```mermaid
 graph TD
-    subgraph STATIC["STATIC ALLOCATION"]
-        S1["Sequence A<br/>4K pre-allocated<br/>Used: 512 tokens<br/>Waste: 3.5K"]
-        S2["Sequence B<br/>4K pre-allocated<br/>Used: 128 tokens<br/>Waste: 3.9K"]
-        S3["Unused Overhead<br/>7.5K slots<br/>80% Fragmented"]
-    end
+    S1[Static: Seq A<br/>4K pre-allocated] --> S2[Static: Seq B<br/>4K pre-allocated]
+    S2 --> S3[Wasted: 7.5K slots]
     
-    subgraph DYNAMIC["DYNAMIC ALLOCATION"]
-        D1["Sequence A<br/>2 blocks 32 tokens<br/>Exact fit"]
-        D2["Sequence B<br/>1 block 16 tokens<br/>Exact fit"]
-        D3["Free Blocks<br/>Many available<br/>On-demand"]
-    end
+    D1[Dynamic: Seq A<br/>2 blocks 32 tokens] --> D2[Dynamic: Seq B<br/>1 block 16 tokens]
+    D2 --> D3[Free: Many blocks available]
     
-    STATS["100 Concurrent Sequences<br/><br/>Static: 400K slots, 320K wasted (80%)<br/>Dynamic: 80K slots, 10K wasted (12.5%)"]
+    S3 -->|Fixed overhead| Problem[Cannot serve many users]
+    D3 -->|On-demand| Solution[More concurrent users]
     
-    S1 --> S3
-    S2 --> S3
-    D1 --> D3
-    D2 --> D3
-    S3 --> STATS
-    D3 --> STATS
+    Metrics[100 concurrent sequences:<br/>Static: 400K slots, 320K wasted 80%<br/>Dynamic: 80K slots, 10K wasted 12.5%]
     
-    style STATIC fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#1a1a1a
-    style S1 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style S2 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style S3 fill:#c2185b,color:#ffffff,stroke:#880e4f,stroke-width:3px
-    style DYNAMIC fill:#e0f2f1,stroke:#00796b,stroke-width:3px,color:#1a1a1a
-    style D1 fill:#b2dfdb,stroke:#004d40,stroke-width:2px,color:#1a1a1a
-    style D2 fill:#b2dfdb,stroke:#004d40,stroke-width:2px,color:#1a1a1a
-    style D3 fill:#00796b,color:#ffffff,stroke:#004d40,stroke-width:3px
-    style STATS fill:#1a1a1a,color:#e0f2f1,stroke:#00796b,stroke-width:3px
+    style S3 fill:#fca5a5
+    style D3 fill:#bbf7d0
+    style Problem fill:#ef4444
+    style Solution fill:#bbf7d0
 ```
 
 ### **Step 2.2: The Fragmentation Problem Emerges**
@@ -304,28 +275,26 @@ def demonstrate_fragmentation():
 
 ```mermaid
 graph TD
-    subgraph TIMELINE["MEMORY FRAGMENTATION TIMELINE"]
-        T0["T=0: All Active<br/>SeqA: B0 B1<br/>SeqB: B2 B3<br/>SeqC: B4 B5<br/>SeqD: B6 B7"]
-        T1["T=1: SeqA & C Leave<br/>Free: B0 B1, B4 B5<br/>Used: B2 B3 SeqB<br/>Used: B6 B7 SeqD"]
-        T2["T=2: SeqE Needs 3 Blocks<br/>Request: Contiguous 3"]
-    end
+    T0[T=0: All sequences active<br/>A: B0 B1, B: B2 B3, C: B4 B5, D: B6 B7]
     
-    FRAGSTAT["Memory State<br/>Free Blocks: 4 total<br/>B0-B1 island 1<br/>B4-B5 island 2<br/>Gap: B2-B3 used"]
+    T1[T=1: A & C finish<br/>Free: B0 B1, B: B2 B3, Free: B4 B5, D: B6 B7]
     
-    ATTEMPT["Allocation Attempt<br/>Max Contiguous: 2 blocks<br/>Needed: 3 blocks<br/>ALLOCATION FAILS"]
+    T2[T=2: New Seq E needs 3 blocks]
     
-    PROBLEM["EXTERNAL FRAGMENTATION<br/>4 Free Blocks Available<br/>1 Request Rejected<br/>47% Effective Utilization"]
+    FB[Free Blocks: 4 total<br/>B0 B1 and B4 B5<br/>Gap: B2 B3 used]
     
-    T0 --> T1 --> T2 --> FRAGSTAT
-    FRAGSTAT --> ATTEMPT --> PROBLEM
+    Attempt[Attempt Allocation]
     
-    style TIMELINE fill:#e3f2fd,stroke:#1565c0,stroke-width:3px,color:#1a1a1a
-    style T0 fill:#bbdefb,stroke:#0d47a1,stroke-width:2px,color:#1a1a1a
-    style T1 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a
-    style T2 fill:#ffccbc,stroke:#d84315,stroke-width:2px,color:#1a1a1a
-    style FRAGSTAT fill:#ffab91,stroke:#bf360c,stroke-width:2px,color:#1a1a1a
-    style ATTEMPT fill:#ffab91,stroke:#bf360c,stroke-width:2px,color:#1a1a1a
-    style PROBLEM fill:#c2185b,color:#ffffff,stroke:#880e4f,stroke-width:3px
+    Result[FAILS!<br/>Max contiguous is 2<br/>External Fragmentation]
+    
+    T0 --> T1
+    T1 --> T2
+    T2 --> FB
+    FB --> Attempt
+    Attempt --> Result
+    
+    style Result fill:#ef4444
+    style FB fill:#fca5a5
 ```
 
 **Key Insight**: We've traded internal fragmentation for **external fragmentation** - free memory exists but isn't contiguous.
@@ -351,29 +320,23 @@ PagedAttention borrows from OS virtual memory:
 
 ```mermaid
 graph TB
-    subgraph LOGICAL["LOGICAL ADDRESS SPACE - Sequence Perspective"]
-        VA1["Sequence A<br/>Virtual Block 0<br/>Positions 0-15"]
-        VA2["Sequence A<br/>Virtual Block 1<br/>Positions 16-31"]
-        VA3["Sequence A<br/>Virtual Block 2<br/>Positions 32-47"]
-        
-        VB1["Sequence B<br/>Virtual Block 0<br/>Positions 0-15"]
-        VB2["Sequence B<br/>Virtual Block 1<br/>Positions 16-31"]
-    end
+    VA1[Seq A: Virt Block 0<br/>Positions 0-15]
+    VA2[Seq A: Virt Block 1<br/>Positions 16-31]
+    VA3[Seq A: Virt Block 2<br/>Positions 32-47]
     
-    subgraph MAPPING["BLOCK TABLE - Translation Layer"]
-        PT1["Sequence A Table<br/>Maps to: 42, 17, 85"]
-        PT2["Sequence B Table<br/>Maps to: 23, 64"]
-    end
+    VB1[Seq B: Virt Block 0<br/>Positions 0-15]
+    VB2[Seq B: Virt Block 1<br/>Positions 16-31]
     
-    subgraph PHYSICAL["PHYSICAL VRAM - GPU Memory"]
-        P42["Physical Block 42<br/>Sequence A Data"]
-        P17["Physical Block 17<br/>Sequence A Data"]
-        P85["Physical Block 85<br/>Sequence A Data"]
-        P23["Physical Block 23<br/>Sequence B Data"]
-        P64["Physical Block 64<br/>Sequence B Data"]
-        P87["Physical Block 87<br/>FREE"]
-        P88["Physical Block 88<br/>FREE"]
-    end
+    PT1[A Table: 42, 17, 85]
+    PT2[B Table: 23, 64]
+    
+    P42[Physical Block 42]
+    P17[Physical Block 17]
+    P85[Physical Block 85]
+    P23[Physical Block 23]
+    P64[Physical Block 64]
+    P87[Free Block 87]
+    P88[Free Block 88]
     
     VA1 --> PT1
     VA2 --> PT1
@@ -387,23 +350,8 @@ graph TB
     PT2 --> P23
     PT2 --> P64
     
-    style LOGICAL fill:#e1f5fe,stroke:#01579b,stroke-width:3px,color:#1a1a1a
-    style VA1 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style VA2 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style VA3 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style VB1 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style VB2 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style MAPPING fill:#fff9c4,stroke:#f57f17,stroke-width:3px,color:#1a1a1a
-    style PT1 fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style PT2 fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style PHYSICAL fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#1a1a1a
-    style P42 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style P17 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style P85 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style P23 fill:#66bb6a,stroke:#43a047,stroke-width:2px,color:#1a1a1a
-    style P64 fill:#66bb6a,stroke:#43a047,stroke-width:2px,color:#1a1a1a
-    style P87 fill:#a5d6a7,stroke:#558b2f,stroke-width:2px,color:#1a1a1a
-    style P88 fill:#a5d6a7,stroke:#558b2f,stroke-width:2px,color:#1a1a1a
+    style P87 fill:#bbf7d0
+    style P88 fill:#bbf7d0
 ```
 
 ### **Step 3.2: Core Data Structures Implementation**
@@ -506,50 +454,25 @@ class PagedKVCache:
 
 ```mermaid
 graph TD
-    subgraph REQUEST["TOKEN ARRIVAL AND INDEXING"]
-        T1["Token Arrives<br/>Position: 42<br/>Sequence ID: chat_123"]
-    end
+    T1[1. Token Arrives<br/>Position 42<br/>Sequence: chat_123]
     
-    subgraph TRANSLATION["ADDRESS TRANSLATION"]
-        BT["Step 1: Block Table Lookup<br/>block_tables chat_123<br/>Returns: 15, 87, 42, 91"]
-        
-        Calc["Step 2: Calculate Address<br/>block_idx = 42 / 16 = 2<br/>offset = 42 % 16 = 10"]
-        
-        Map["Step 3: Map to Physical<br/>physical_block = table[2]<br/>Result: Block 42"]
-    end
+    BT[2. Block Table Lookup<br/>block_tables chat_123 = 15, 87, 42, 91]
     
-    subgraph MEMORY["MEMORY ACCESS"]
-        PM["Step 4: Physical Memory Access<br/>Address: Block 42, Slot 10"]
-        
-        Read["Step 5: Store K/V Data<br/>Write token at (42, 10)"]
-    end
+    Calc[3. Calculate Address<br/>Block idx = 42 ÷ 16 = 2<br/>Offset = 42 % 16 = 10]
     
-    subgraph KERNEL["GPU KERNEL EXECUTION"]
-        Kernel["Step 6: PagedAttention Kernel<br/>Input: Q, block_tables, seq_lens<br/>Process 100s tokens parallel<br/>Compiled SlotMapping ready"]
-    end
+    Map[4. Map to Physical<br/>Physical block = table 2 = 42]
     
-    BENEFITS["KEY ADVANTAGES<br/>Zero fragmentation<br/>O(1) allocation<br/>Non-contiguous storage<br/>Efficient concurrent serving"]
+    PM[5. Physical Memory Access<br/>Block 42, Slot 10]
     
-    T1 --> BT
-    BT --> Calc
-    Calc --> Map
-    Map --> PM
-    PM --> Read
-    Read --> Kernel
-    Kernel --> BENEFITS
+    Read[6. Read/Write K/V<br/>at block=42, slot=10]
     
-    style REQUEST fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#1a1a1a
-    style T1 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style TRANSLATION fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#1a1a1a
-    style BT fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style Calc fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style Map fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style MEMORY fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a
-    style PM fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style Read fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style KERNEL fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#1a1a1a
-    style Kernel fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px,color:#1a1a1a
-    style BENEFITS fill:#1a1a1a,color:#c8e6c9,stroke:#2e7d32,stroke-width:3px
+    Kernel[7. PagedAttention Kernel<br/>Input: Q, block_tables, seq_lens<br/>Processes 100s tokens parallel]
+    
+    T1 --> BT --> Calc --> Map --> PM --> Read --> Kernel
+    
+    Efficiency[Key Advantages:<br/>Zero fragmentation<br/>O1 allocation<br/>Efficient sharing]
+    
+    Kernel --> Efficiency
 ```
 
 ### **Step 3.3: The Slot Mapping Optimization**
@@ -657,44 +580,27 @@ def paged_attention_forward(q: Tensor, slot_mapping: SlotMapping,
 
 ```mermaid
 graph TD
-    subgraph BATCH["BATCH FLATTENING"]
-        S1["Sequence A<br/>5 tokens<br/>Blocks: 42, 15"]
-        S2["Sequence B<br/>10 tokens<br/>Blocks: 23, 64, 87"]
-        S3["Sequence C<br/>3 tokens<br/>Blocks: 91"]
-    end
+    S1[Sequence A: 5 tokens<br/>Block Table: 42, 15]
+    S2[Sequence B: 10 tokens<br/>Block Table: 23, 64, 87]
+    S3[Sequence C: 3 tokens<br/>Block Table: 91]
     
-    subgraph FLAT["FLATTEN TO TOKEN STREAM"]
-        TP["Token Array<br/>A0 A1 A2 A3 A4 | B0 B1 ... B9 | C0 C1 C2<br/>18 tokens total"]
-    end
+    TP[Flattened Tokens<br/>A0 A1 A2 A3 A4 B0...B9 C0 C1 C2<br/>Total: 18 tokens]
     
-    subgraph CALC["SLOT CALCULATION"]
-        EX["Example: Seq B, Token 25<br/>block_idx = 25 / 16 = 1<br/>offset = 25 % 16 = 9<br/>physical_block = blocks[1] = 64<br/>slot = 64 * 32 + 9 * 2 = 2050"]
-    end
+    SC1[Slot Calculation:<br/>1. Get block table<br/>2. block_idx = pos ÷ 16<br/>3. offset = pos % 16<br/>4. Get physical block<br/>5. slot = block × 32 + offset × 2]
     
-    subgraph MAPPING["SLOT MAPPING CONSTRUCTION"]
-        SM["Slot Mapping Tensor<br/>K_slots: [1344, 1346, 1348, ...]<br/>V_slots: [1345, 1347, 1349, ...]<br/>One tensor for all tokens"]
-    end
+    Example[Example: Seq B token 25<br/>block_idx = 25 ÷ 16 = 1<br/>offset = 25 % 16 = 9<br/>physical_block = 64<br/>slot = 64 × 32 + 9 × 2 = 2050]
     
-    EXECUTION["GPU KERNEL BENEFITS<br/>Parallel random access<br/>No per-sequence logic<br/>Coalesced memory reads<br/>Maximum throughput"]
+    SM[Slot Mapping Tensor<br/>1344,1345 for A0<br/>1346,1347 for A1<br/>2050,2051 for B25]
+    
+    Note[Single tensor for all tokens<br/>Parallel random access<br/>No per-sequence logic]
     
     S1 --> TP
     S2 --> TP
     S3 --> TP
-    TP --> EX
-    EX --> SM
-    SM --> EXECUTION
-    
-    style BATCH fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#1a1a1a
-    style S1 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style S2 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style S3 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style FLAT fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style TP fill:#4fc3f7,stroke:#01579b,stroke-width:2px,color:#1a1a1a
-    style CALC fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#1a1a1a
-    style EX fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style MAPPING fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a
-    style SM fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style EXECUTION fill:#1a1a1a,color:#c8e6c9,stroke:#2e7d32,stroke-width:3px
+    TP --> SC1
+    SC1 --> Example
+    Example --> SM
+    SM --> Note
 ```
 
 ---
@@ -767,50 +673,38 @@ class BlockSparsePagedAttention(PagedKVCache):
 
 ```mermaid
 graph TD
-    subgraph FULL["FULL ATTENTION - Every Token To All Blocks"]
-        FA1["Block 0<br/>Attention to All 8 blocks"]
-        FA2["Block 1<br/>Attention to All 8 blocks"]
-        FA3["Block 2<br/>Attention to All 8 blocks"]
-        FA4["..."]
-        FA5["Block 7<br/>Attention to All 8 blocks"]
-    end
+    FA1[Full Attention:<br/>Block 0 → All 8 blocks]
+    FA2[Block 1 → All 8 blocks]
+    FA3[Block 2 → All 8 blocks]
+    FA4[Block 7 → All 8 blocks]
     
-    subgraph SPARSE["SPARSE ATTENTION - Local Window Size=3"]
-        SA1["Block 0<br/>Attention to Block 0"]
-        SA2["Block 1<br/>Attention to Blocks 0-1"]
-        SA3["Block 2<br/>Attention to Blocks 0-2"]
-        SA4["Block 3<br/>Attention to Blocks 1-3"]
-        SA5["Block 4<br/>Attention to Blocks 2-4"]
-        SA6["Block 5<br/>Attention to Blocks 3-5"]
-        SA7["Block 6<br/>Attention to Blocks 4-6"]
-        SA8["Block 7<br/>Attention to Blocks 5-7"]
-    end
+    SA1[Sparse Window=3:<br/>Block 0 → Block 0]
+    SA2[Block 1 → Blocks 0-1]
+    SA3[Block 2 → Blocks 0-2]
+    SA4[Block 3 → Blocks 1-3]
+    SA5[Block 4 → Blocks 2-4]
+    SA6[Block 5 → Blocks 3-5]
+    SA7[Block 6 → Blocks 4-6]
+    SA8[Block 7 → Blocks 5-7]
     
-    subgraph METRICS["PERFORMANCE ANALYSIS"]
-        PERF["For 8 Blocks<br/><br/>Full Attention: 64 block-pairs<br/>Sparse Attention: 24 block-pairs<br/><br/>Memory Traffic Reduction: 62.5%<br/>Decode Phase Speedup: 2x"]
-    end
+    Metrics[Performance 8 blocks:<br/>Full: 64 block-pairs<br/>Sparse: 24 block-pairs<br/>62.5% reduction]
     
-    FA1 --> FA2 --> FA3 --> FA4 --> FA5
+    FA1 --> FA2 --> FA3 --> FA4
     SA1 --> SA2 --> SA3 --> SA4 --> SA5 --> SA6 --> SA7 --> SA8
-    FA5 --> PERF
-    SA8 --> PERF
+    SA8 --> Metrics
     
-    style FULL fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#1a1a1a
-    style FA1 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style FA2 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style FA3 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style FA5 fill:#f8bbd0,stroke:#ad1457,stroke-width:2px,color:#1a1a1a
-    style SPARSE fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#1a1a1a
-    style SA1 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA2 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA3 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA4 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA5 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA6 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA7 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SA8 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style METRICS fill:#1a1a1a,color:#c8e6c9,stroke:#2e7d32,stroke-width:3px
-    style PERF fill:#1a1a1a,color:#c8e6c9
+    style FA1 fill:#f3f4f6
+    style FA2 fill:#f3f4f6
+    style FA3 fill:#f3f4f6
+    style FA4 fill:#f3f4f6
+    style SA1 fill:#bbf7d0
+    style SA2 fill:#bbf7d0
+    style SA3 fill:#bbf7d0
+    style SA4 fill:#bbf7d0
+    style SA5 fill:#bbf7d0
+    style SA6 fill:#bbf7d0
+    style SA7 fill:#bbf7d0
+    style SA8 fill:#bbf7d0
 ```
 
 ### **Step 4.2: Prefix Caching & Sharing**
@@ -889,32 +783,22 @@ class PrefixCachingKVCache(PagedKVCache):
 
 ```mermaid
 graph TD
-    subgraph SYSTEM["SHARED SYSTEM PROMPT - Common Prefix"]
-        SP["Prompt Text<br/>You are a helpful assistant...<br/>Hash: abc123<br/>Length: 12 tokens"]
-    end
+    SP[System Prompt<br/>You are a helpful assistant<br/>Hash: abc123<br/>Length: 12 tokens]
     
-    subgraph USERS["CONCURRENT REQUESTS"]
-        UR1["User 1<br/>Explain quantum physics<br/>Total: 15 tokens"]
-        UR2["User 2<br/>Write a poem about AI<br/>Total: 17 tokens"]
-        UR3["User 3<br/>Debug this Python code<br/>Total: 18 tokens"]
-    end
+    UR1[User 1: Explain quantum physics<br/>Total: 15 tokens]
+    UR2[User 2: Write a poem about AI<br/>Total: 17 tokens]
+    UR3[User 3: Debug this Python code<br/>Total: 18 tokens]
     
-    subgraph TABLES["BLOCK TABLES"]
-        BT1["User 1 Table<br/>42, 87, 15, 23"]
-        BT2["User 2 Table<br/>42, 87, 15, 64, 91"]
-        BT3["User 3 Table<br/>42, 87, 15, 33, 78"]
-    end
+    BT1[User 1 Table: 42, 87, 15, 23]
+    BT2[User 2 Table: 42, 87, 15, 64, 91]
+    BT3[User 3 Table: 42, 87, 15, 33, 78]
     
-    subgraph BLOCKS["PHYSICAL BLOCKS"]
-        P1["SHARED PREFIX BLOCKS<br/>B42, B87, B15<br/>Reference Count: 3"]
-        P2["User 1 Unique<br/>B23"]
-        P3["User 2 Unique<br/>B64, B91"]
-        P4["User 3 Unique<br/>B33, B78"]
-    end
+    P1[Prefix Blocks SHARED:<br/>B42, B87, B15]
+    P2[User 1 unique: B23]
+    P3[User 2 unique: B64, B91]
+    P4[User 3 unique: B33, B78]
     
-    subgraph SAVINGS["MEMORY EFFICIENCY"]
-        MEM["Without Prefix Sharing: 9 blocks x 3 = 27 allocations<br/>With Prefix Sharing: 3 shared + 6 unique = 9 blocks<br/><br/>Memory Reduction: 66%<br/>Serving Capacity: 3x improvement"]
-    end
+    Metrics[Memory Savings:<br/>Without: 9 blocks 3 each<br/>With: 3 blocks shared<br/>66% reduction]
     
     SP --> UR1
     SP --> UR2
@@ -928,25 +812,10 @@ graph TD
     BT1 --> P2
     BT2 --> P3
     BT3 --> P4
-    P1 --> MEM
+    P1 --> Metrics
     
-    style SYSTEM fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#1a1a1a
-    style SP fill:#ffe082,stroke:#f57c00,stroke-width:2px,color:#1a1a1a
-    style USERS fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#1a1a1a
-    style UR1 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style UR2 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style UR3 fill:#b3e5fc,stroke:#0277bd,stroke-width:2px,color:#1a1a1a
-    style TABLES fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#1a1a1a
-    style BT1 fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px,color:#1a1a1a
-    style BT2 fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px,color:#1a1a1a
-    style BT3 fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px,color:#1a1a1a
-    style BLOCKS fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px,color:#1a1a1a
-    style P1 fill:#ffe082,stroke:#f57f17,stroke-width:3px,color:#1a1a1a
-    style P2 fill:#b3e5fc,stroke:#01579b,stroke-width:2px,color:#1a1a1a
-    style P3 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style P4 fill:#81c784,stroke:#388e3c,stroke-width:2px,color:#1a1a1a
-    style SAVINGS fill:#1a1a1a,color:#c8e6c9,stroke:#2e7d32,stroke-width:3px
-    style MEM fill:#1a1a1a,color:#c8e6c9
+    style P1 fill:#fef3c7
+    style Metrics fill:#bbf7d0
 ```
 
 ---
