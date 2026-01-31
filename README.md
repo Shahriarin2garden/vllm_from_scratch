@@ -31,33 +31,60 @@ The fundamental insight driving this project is that **LLM inference is architec
 
 ### What We're Building: A Three-Layer System
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    APPLICATION LAYER                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ Request API  │  │   Sampling   │  │  Tokenizer   │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   SCHEDULING & ORCHESTRATION                     │
-│  ┌────────────────────────────────────────────────────┐         │
-│  │  Continuous Batching Scheduler                      │         │
-│  │  • Dynamic batch formation (prefill + decode mix)   │         │
-│  │  • Resource-aware admission control                 │         │
-│  │  • Priority-based queuing (FCFS, SJF, Priority)     │         │
-│  └────────────────────────────────────────────────────┘         │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   MEMORY & EXECUTION LAYER                       │
-│  ┌──────────────────────────┐  ┌──────────────────────┐        │
-│  │  PagedAttention Engine   │  │  Model Executor      │        │
-│  │  • Block-based KV cache  │  │  • Fused kernels     │        │
-│  │  • Virtual addressing    │  │  • Batched attention │        │
-│  │  • Zero external frag    │  │  • Quantization      │        │
-│  └──────────────────────────┘  └──────────────────────┘        │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph APP_LAYER [" APPLICATION LAYER "]
+        direction LR
+        API["Request API<br/>REST/gRPC Interface"]
+        SAMPLING["Sampling Engine<br/>Temperature, Top-k, Top-p"]
+        TOKENIZER["Tokenizer<br/>BPE/WordPiece"]
+    end
+
+    subgraph SCHED_LAYER [" SCHEDULING & ORCHESTRATION "]
+        direction TB
+        SCHEDULER["Continuous Batching Scheduler"]
+        
+        subgraph SCHED_FEATURES [" "]
+            direction TB
+            SF1["• Dynamic batch formation<br/>  (prefill + decode mix)"]
+            SF2["• Resource-aware<br/>  admission control"]
+            SF3["• Priority-based queuing<br/>  (FCFS, SJF, Priority)"]
+        end
+        
+        SCHEDULER -.-> SCHED_FEATURES
+    end
+
+    subgraph EXEC_LAYER [" MEMORY & EXECUTION LAYER "]
+        direction LR
+        
+        subgraph PAGED ["PagedAttention Engine"]
+            direction TB
+            PA1["• Block-based KV cache"]
+            PA2["• Virtual addressing"]
+            PA3["• Zero external frag"]
+        end
+        
+        subgraph EXECUTOR ["Model Executor"]
+            direction TB
+            EX1["• Fused kernels"]
+            EX2["• Batched attention"]
+            EX3["• Quantization"]
+        end
+    end
+
+    APP_LAYER --> SCHED_LAYER
+    SCHED_LAYER --> EXEC_LAYER
+
+    style APP_LAYER fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#000
+    style SCHED_LAYER fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style EXEC_LAYER fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
+    style API fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style SAMPLING fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style TOKENIZER fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style SCHEDULER fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style SCHED_FEATURES fill:#f3e5f5,stroke:#ba68c8,stroke-width:1px,stroke-dasharray: 5 5,color:#000
+    style PAGED fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style EXECUTOR fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
 ```
 
 ---
