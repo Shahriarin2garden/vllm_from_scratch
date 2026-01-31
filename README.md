@@ -33,15 +33,15 @@ flowchart LR
         T_BACKWARD["⟲ Backward Pass<br/>(Gradients ∇θ)"]
         T_OPTIMIZER["Optimizer<br/>(AdamW states)"]
         
-        T_INPUT --> T_HIDDEN
-        T_PARAMS1 --> T_HIDDEN
-        T_HIDDEN --> T_OUTPUT
-        T_PARAMS2 --> T_OUTPUT
-        T_OUTPUT --> T_LOSS
-        T_LOSS -.-> T_BACKWARD
-        T_BACKWARD -.-> T_OPTIMIZER
-        T_OPTIMIZER -.-> T_PARAMS1
-        T_OPTIMIZER -.-> T_PARAMS2
+        T_INPUT ==> T_HIDDEN
+        T_PARAMS1 ==> T_HIDDEN
+        T_HIDDEN ==> T_OUTPUT
+        T_PARAMS2 ==> T_OUTPUT
+        T_OUTPUT ==> T_LOSS
+        T_LOSS ===> T_BACKWARD
+        T_BACKWARD ===> T_OPTIMIZER
+        T_OPTIMIZER ===> T_PARAMS1
+        T_OPTIMIZER ===> T_PARAMS2
     end
 
     subgraph INFERENCE [" INFERENCE PIPELINE "]
@@ -54,15 +54,17 @@ flowchart LR
         I_SAMPLE["Sampling<br/>(Argmax/Top-k)"]
         I_LOOP["⟳ Autoregressive<br/>Loop"]
         
-        I_INPUT --> I_HIDDEN
-        I_PARAMS1 --> I_HIDDEN
-        I_HIDDEN --> I_OUTPUT
-        I_PARAMS2 --> I_OUTPUT
-        I_OUTPUT --> I_SAMPLE
-        I_SAMPLE -.-> I_LOOP
-        I_LOOP -.-> I_INPUT
+        I_INPUT ==> I_HIDDEN
+        I_PARAMS1 ==> I_HIDDEN
+        I_HIDDEN ==> I_OUTPUT
+        I_PARAMS2 ==> I_OUTPUT
+        I_OUTPUT ==> I_SAMPLE
+        I_SAMPLE ===> I_LOOP
+        I_LOOP ===> I_INPUT
     end
 
+    linkStyle default stroke:#333,stroke-width:3px
+    
     style TRAINING fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
     style INFERENCE fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
     style T_INPUT fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
@@ -134,8 +136,11 @@ flowchart TB
         end
     end
 
-    APP_LAYER --> SCHED_LAYER
-    SCHED_LAYER --> EXEC_LAYER
+    APP_LAYER ==> SCHED_LAYER
+    SCHED_LAYER ==> EXEC_LAYER
+
+    linkStyle 0 stroke:#1976d2,stroke-width:4px
+    linkStyle 1 stroke:#7b1fa2,stroke-width:4px
 
     style APP_LAYER fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#000
     style SCHED_LAYER fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
