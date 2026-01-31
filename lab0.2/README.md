@@ -3801,3 +3801,8 @@ class FailureRecoverySystem:
 ```
 
 This comprehensive guide covers LLM inference from first principles to production-grade distributed systems. The content is structured to build understanding progressively, with each section adding depth and complexity. The diagrams provide visual explanations of key concepts, while the code examples show real implementations from major inference engines.
+
+
+---
+
+**Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
