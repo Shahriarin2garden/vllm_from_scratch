@@ -327,13 +327,13 @@ flowchart TD
 For sequence length $n$, hidden dimension $d$, and batch size $B$:
 
 $$
-\text{Cache Size} = 2 \times B \times n \times d \times \text{dtype\_size}
+\text{Cache Size} = 2 \times B \times n \times d \times \text{dtype}_{\text{size}}
 $$
 
 For multi-head attention with $h$ heads:
 
 $$
-\text{Cache Size} = 2 \times B \times n \times h \times d_h \times \text{dtype\_size}
+\text{Cache Size} = 2 \times B \times n \times h \times d_h \times \text{dtype}_{\text{size}}
 $$
 
 where $d_h = d / h$.
