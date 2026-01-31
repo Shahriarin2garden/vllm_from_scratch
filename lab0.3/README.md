@@ -636,7 +636,7 @@ Block-Sparse Attention says: "Let's not load the irrelevant pages into the extre
 **Code Explanation for Researchers:**
 The `BlockSparsePagedAttention` class introduces a `sparsity_pattern` mask.
 Instead of the standard `read_for_attention` which grabs *everything*, `sparse_read` filters the block list.
-This reduces the memory bandwidth requirement from $O(N)$ to $O(\text{window\_size})$, which is a massive speedup for long-context models.
+This reduces the memory bandwidth requirement from $O(N)$ to $O(\text{window}_{\text{size}})$, which is a massive speedup for long-context models.
 
 Not all tokens need attention to all previous tokens. We can skip loading irrelevant blocks.
 
