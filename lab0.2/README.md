@@ -25,9 +25,9 @@ The diagram below is a map of this two-phase engine. Key elements to focus on:
 *   **The Recursion Loop:** Represents the Decode phase, where the output loops back to become the new input.
 *   **KV Cache:** The "short-term memory" block. This prevents the model from having to re-read the prompt for every single new word it generates.
 
-<!-- ![architecture_02](architecture_02.png) -->
+ ![architecture_02](architecture_02.png)
 
-![architecture_02](architecture_02.jpg)
+<!-- ![architecture_02](architecture_02.jpg) -->
 
 ## **1. Introduction: The Heartbeat of LLM Inference**
 
