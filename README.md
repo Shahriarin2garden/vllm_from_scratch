@@ -20,6 +20,68 @@ This repository documents the complete architectural journey of building **nano-
 
 The fundamental insight driving this project is that **LLM inference is architecturally distinct from training**. While training graphs are bidirectional (forward + backward passes), compute-intensive, and memory-dominated by gradients and optimizer states, inference operates on a completely different set of constraints:
 
+```mermaid
+flowchart LR
+    subgraph TRAINING [" TRAINING PIPELINE "]
+        direction TB
+        T_INPUT["Input x<br/>(Batch of sequences)"]
+        T_PARAMS1["Params θ₁<br/>(Weights)"]
+        T_HIDDEN["Hidden h<br/>(Activations)"]
+        T_PARAMS2["Params θ₂<br/>(More weights)"]
+        T_OUTPUT["Output y<br/>(Predictions)"]
+        T_LOSS["Loss J<br/>(Cross-entropy)"]
+        T_BACKWARD["⟲ Backward Pass<br/>(Gradients ∇θ)"]
+        T_OPTIMIZER["Optimizer<br/>(AdamW states)"]
+        
+        T_INPUT --> T_HIDDEN
+        T_PARAMS1 --> T_HIDDEN
+        T_HIDDEN --> T_OUTPUT
+        T_PARAMS2 --> T_OUTPUT
+        T_OUTPUT --> T_LOSS
+        T_LOSS -.-> T_BACKWARD
+        T_BACKWARD -.-> T_OPTIMIZER
+        T_OPTIMIZER -.-> T_PARAMS1
+        T_OPTIMIZER -.-> T_PARAMS2
+    end
+
+    subgraph INFERENCE [" INFERENCE PIPELINE "]
+        direction TB
+        I_INPUT["Input x<br/>(Single prompt)"]
+        I_PARAMS1["Params θ₁<br/>(Frozen weights)"]
+        I_HIDDEN["Hidden h<br/>(+ KV Cache)"]
+        I_PARAMS2["Params θ₂<br/>(Frozen weights)"]
+        I_OUTPUT["Output y<br/>(Next token)"]
+        I_SAMPLE["Sampling<br/>(Argmax/Top-k)"]
+        I_LOOP["⟳ Autoregressive<br/>Loop"]
+        
+        I_INPUT --> I_HIDDEN
+        I_PARAMS1 --> I_HIDDEN
+        I_HIDDEN --> I_OUTPUT
+        I_PARAMS2 --> I_OUTPUT
+        I_OUTPUT --> I_SAMPLE
+        I_SAMPLE -.-> I_LOOP
+        I_LOOP -.-> I_INPUT
+    end
+
+    style TRAINING fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style INFERENCE fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style T_INPUT fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style T_PARAMS1 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style T_HIDDEN fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style T_PARAMS2 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style T_OUTPUT fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style T_LOSS fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style T_BACKWARD fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style T_OPTIMIZER fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style I_INPUT fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style I_PARAMS1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style I_HIDDEN fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style I_PARAMS2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style I_OUTPUT fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style I_SAMPLE fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style I_LOOP fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+```
+
 | Dimension | Training | Inference (Our Focus) |
 |-----------|----------|----------------------|
 | **Computation Flow** | Bidirectional (forward + backward) | Forward-only, autoregressive |
