@@ -31,19 +31,19 @@ flowchart TD
     B_Node --> C_Node[Subword Segmentation];
     C_Node --> D_Node[Vocabulary ID Lookup];
 
-    subgraph B_Subgraph [Normalization]
+    subgraph B_Subgraph [" NORMALIZATION "]
         B1[Lowercasing?]
         B2[Unicode Normalization<br/>NFKC/NFD]
         B3[Whitespace/Accent Handling]
     end
 
-    subgraph C_Subgraph [BPE Algorithm Applied]
+    subgraph C_Subgraph [" BPE ALGORITHM APPLIED "]
         C1["Find most frequent pair: 'Th' + 'e' -> 'The'"]
         C2["Merge 'cap' + 'ital' -> 'capital'"]
         C3["Remainder: 'of', 'France', 'is'"]
     end
 
-    subgraph D_Subgraph [Map to Indices]
+    subgraph D_Subgraph [" MAP TO INDICES "]
         D1["'The' -> 1"]
         D2["'capital' -> 307"]
         D3["'of' -> 2647"]
@@ -53,11 +53,27 @@ flowchart TD
 
     D_Node --> E["Output Tensor<br/>Shape: [seq_len=5]<br/>[1, 307, 2647, 310, 278]"];
 
-    style A fill:#4a5568
-    style B_Node fill:#2d3748
-    style C_Node fill:#2d3748
-    style D_Node fill:#2d3748
-    style E fill:#48bb78
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style A fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style B_Node fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style C_Node fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D_Node fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style E fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style B_Subgraph fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+    style C_Subgraph fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#000
+    style D_Subgraph fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style B1 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style B2 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style B3 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style C1 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style C2 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style C3 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style D1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D3 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D4 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D5 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
 
 ```
 
@@ -204,6 +220,47 @@ def process_prompt_batch(engine, prompts: List[str]):
 
 ```
 
+### **1.4 Iterative Prefill→Decode Timeline**
+
+Seeing the request lifecycle as a repeating loop makes it easier to reason about latency and cache pressure. The diagram below shows a single request as it moves from the heavy **prefill** into lightweight **decode** steps, with the KV Cache accumulating state over time.
+
+```mermaid
+flowchart LR
+    subgraph Prefill [" PREFILL PHASE: Process Full Prompt "]
+        P1["Tokenize prompt<br/>S tokens"] --> P2["Embed all S tokens"];
+        P2 --> P3["Run transformer layers<br/>build KV for S tokens"];
+        P3 --> P4["Sample token t₍S+1₎"];
+    end
+
+    subgraph Decode [" DECODE PHASE: Iterative Loop "]
+        D1["Take last token<br/>t₍S+i₎"] --> D2["Embed single token"];
+        D2 --> D3["Lookup block table<br/>gather KV pages"];
+        D3 --> D4["Attention using cached KV<br/>O(1) new rows"];
+        D4 --> D5["Append K,V for t₍S+i₎"];
+        D5 --> D6["Sample t₍S+i+1₎"];
+    end
+
+    Prefill ==>|"KV Cache now has S rows"| Decode;
+    D6 ==>|"Repeat until EOS or max_tokens"| D1;
+
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Prefill fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style Decode fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style P1 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style P2 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style P3 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style P4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style D1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D3 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D4 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D5 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D6 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+```
+
+**Why this matters**: Prefill dominates **compute** and is easy to batch; decode dominates **memory bandwidth** and suffers when the KV Cache fragments. Optimized engines treat these phases as different workloads, even though they share the same graph.
+
 ## **2. Training vs. Inference: A Computational Divergence**
 
 The most critical systems insight is that **serving (inference) is not training**. The training graph is complex, stateful, and designed for learning. The inference graph is a streamlined, forward-only pipeline for calculation.
@@ -212,46 +269,66 @@ The most critical systems insight is that **serving (inference) is not training*
 
 ```mermaid
 flowchart TD
-    subgraph Training_Graph [Training Computational Graph]
+    subgraph Training_Graph [" TRAINING COMPUTATIONAL GRAPH "]
         direction TB
-        TG_Weights[Model Weights FP16] --> TG_FP[Forward Pass<br/>Compute Activations];
-        TG_FP --> TG_Loss[Loss Calculation<br/>Cross-Entropy];
-        TG_Loss --> TG_BP[Backward Pass<br/>Compute Gradients];
-        TG_BP --> TG_Grad[Gradients FP16];
-        TG_Grad --> TG_Opt[Optimizer Step<br/>AdamW/Adam];
-        TG_Opt --> TG_Update[Update Weights];
-        TG_Update -.-> TG_Weights;
+        TG_Weights["Model Weights<br/>(FP16)"] --> TG_FP["Forward Pass<br/>Compute Activations"];
+        TG_FP --> TG_Loss["Loss Calculation<br/>(Cross-Entropy)"];
+        TG_Loss --> TG_BP["Backward Pass<br/>Compute Gradients"];
+        TG_BP --> TG_Grad["Gradients<br/>(FP16)"];
+        TG_Grad --> TG_Opt["Optimizer Step<br/>(AdamW/Adam)"];
+        TG_Opt --> TG_Update["Update Weights"];
+        TG_Update ===> TG_Weights;
 
-        subgraph TG_Mem [Peak Memory Includes]
-            M1[Weights: 2 bytes/param]
-            M2[Gradients: 2 bytes/param]
-            M3["Optimizer States<br/>Momentum, Variance: 8 bytes/param"]
-            M4[Activations for Gradients<br/>~20-100 bytes/token]
+        subgraph TG_Mem [" Peak Memory Includes "]
+            M1["• Weights: 2 bytes/param"]
+            M2["• Gradients: 2 bytes/param"]
+            M3["• Optimizer States<br/>  (Momentum, Variance):<br/>  8 bytes/param"]
+            M4["• Activations: 20-100 bytes/token"]
         end
     end
 
-    subgraph Inference_Graph [Inference Computational Graph]
+    subgraph Inference_Graph [" INFERENCE COMPUTATIONAL GRAPH "]
         direction TB
-        IG_Weights["Model Weights<br/>FP16/INT8/INT4"] --> IG_FP[Forward Pass Only];
-        IG_KV[[Dynamic KV Cache]] --> IG_FP;
-        IG_FP --> IG_Sample[Sample Next Token];
-        IG_FP --> IG_UpdateKV[Append to KV Cache];
-        IG_UpdateKV -.-> IG_KV;
+        IG_Weights["Model Weights<br/>(FP16/INT8/INT4)"] --> IG_FP["Forward Pass Only"];
+        IG_KV[["Dynamic KV Cache"]] ==> IG_FP;
+        IG_FP --> IG_Sample["Sample Next Token"];
+        IG_FP --> IG_UpdateKV["Append to KV Cache"];
+        IG_UpdateKV ===> IG_KV;
 
-        subgraph IG_Mem [Peak Memory Dominated By]
-            M5["Weights: 2-0.5 bytes/param"]
-            M6["KV Cache: Variable<br/>Batch × Seq × Layers × Heads × Dim × 2 × dtype"]
-            M7[Activations: Minimal<br/>Only forward pass needed]
+        subgraph IG_Mem [" Peak Memory Dominated By "]
+            M5["• Weights: 0.5-2 bytes/param"]
+            M6["• KV Cache: Variable<br/>  Batch × Seq × Layers ×<br/>  Heads × Dim × 2 × dtype"]
+            M7["• Activations: Minimal<br/>  (Forward pass only)"]
         end
     end
 
-    Training_Graph -- "Remove Gradients, Optimizer, Backward Pass" --> Inference_Graph;
+    Training_Graph ===>|"Remove Gradients,<br/>Optimizer, Backward Pass"| Inference_Graph;
 
-    style Training_Graph fill:#2d3748
-    style Inference_Graph fill:#2d3748
-    style TG_Mem fill:#f56565
-    style IG_Mem fill:#48bb78
-    style IG_Weights fill:#805ad5
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Training_Graph fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style Inference_Graph fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style TG_Weights fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style TG_FP fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style TG_Loss fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style TG_BP fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style TG_Grad fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style TG_Opt fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style TG_Update fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style TG_Mem fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#000
+    style IG_Weights fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style IG_FP fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style IG_KV fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style IG_Sample fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style IG_UpdateKV fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style IG_Mem fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+    style M1 fill:#bbdefb,stroke:#1976d2,stroke-width:1px,color:#000
+    style M2 fill:#bbdefb,stroke:#1976d2,stroke-width:1px,color:#000
+    style M3 fill:#bbdefb,stroke:#1976d2,stroke-width:1px,color:#000
+    style M4 fill:#bbdefb,stroke:#1976d2,stroke-width:1px,color:#000
+    style M5 fill:#c5e1a5,stroke:#689f38,stroke-width:1px,color:#000
+    style M6 fill:#c5e1a5,stroke:#689f38,stroke-width:1px,color:#000
+    style M7 fill:#c5e1a5,stroke:#689f38,stroke-width:1px,color:#000
 
 ```
 
@@ -284,40 +361,55 @@ During the forward pass of an attention layer, each token's hidden state is proj
 
 ```mermaid
 flowchart TD
-    subgraph Layer_L [Transformer Layer L]
+    subgraph Layer_L [" TRANSFORMER LAYER L "]
         direction TB
-        subgraph Attention_Head [Single Attention Head]
+        subgraph Attention_Head [" Single Attention Head "]
             direction LR
 
-            subgraph Current_Token [Processing Token t_n]
-                H["Hidden State h_n"] --> Q_Proj[Q Projection];
-                H --> K_Proj[K Projection];
-                H --> V_Proj[V Projection];
+            subgraph Current_Token [" Processing Token t_n "]
+                H["Hidden State<br/>h_n"] --> Q_Proj["Q Projection"];
+                H --> K_Proj["K Projection"];
+                H --> V_Proj["V Projection"];
 
-                Q_Proj --> Q["q_n (Query)"];
-                K_Proj --> K["k_n (Key)"];
-                V_Proj --> V["v_n (Value)"];
+                Q_Proj --> Q["q_n<br/>(Query)"];
+                K_Proj --> K["k_n<br/>(Key)"];
+                V_Proj --> V["v_n<br/>(Value)"];
 
-                Q --> Attention[Attention Module];
+                Q --> Attention["Attention<br/>Module"];
             end
 
-            subgraph KV_Cache [KV Cache for Layer L, Head H]
-                KC["Keys: k₁, k₂, ..., k_{n-1}"];
-                VC["Values: v₁, v₂, ..., v_{n-1}"];
+            subgraph KV_Cache [" KV Cache for Layer L, Head H "]
+                KC["Keys:<br/>k₁, k₂, ..., k_{n-1}"];
+                VC["Values:<br/>v₁, v₂, ..., v_{n-1}"];
             end
 
-            KV_Cache --> Attention;
-            Attention --> O["Output o_n"];
+            KV_Cache ==> Attention;
+            Attention --> O["Output<br/>o_n"];
         end
 
-        O -->|Append to cache| KV_Cache_Update[Update KV Cache];
-        K --> KV_Cache_Update;
-        V --> KV_Cache_Update;
+        O ==>|"Append to cache"| KV_Cache_Update["Update<br/>KV Cache"];
+        K ==> KV_Cache_Update;
+        V ==> KV_Cache_Update;
     end
 
-    style KV_Cache fill:#805ad5
-    style Current_Token fill:#2d3748
-    style Attention_Head fill:#2d3748
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Layer_L fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style Attention_Head fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Current_Token fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
+    style KV_Cache fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style H fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style Q_Proj fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style K_Proj fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style V_Proj fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Q fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style K fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style V fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style KC fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style VC fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Attention fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style O fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style KV_Cache_Update fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
 
 ```
 
@@ -338,6 +430,31 @@ $$
 
 where $d_h = d / h$.
 
+#### **3.1.1 KV Cache Growth per Token (Iterative View)**
+
+This timeline shows how the cache expands and why fragmentation appears without paging.
+
+```mermaid
+sequenceDiagram
+    participant GPU_Mem as GPU Memory
+    participant ReqA as Request A  
+    participant ReqB as Request B
+
+    Note over ReqA: Prefill: 6 tokens
+    ReqA->>GPU_Mem: Allocate KV rows t₁–t₆<br/>(contiguous)
+    Note over ReqA: Decode step 1
+    ReqA->>GPU_Mem: Append KV row t₇
+    Note over ReqA: Decode step 2
+    ReqA->>GPU_Mem: Append KV row t₈
+
+    Note over ReqB: Prefill: 3 tokens
+    ReqB->>GPU_Mem: Allocate KV rows t₁–t₃<br/>(finds gap or tail)
+
+    Note over GPU_Mem: ⚠️ Without paging:<br/>Mixed-length gaps appear as<br/>requests finish; new requests<br/>struggle to find contiguous chunks
+```
+
+**Reading the diagram**: each decode step adds exactly one KV row per layer/head. If memory must stay contiguous, finishing Request A leaves a hole of length 8 rows; Request B might not fit, triggering OOM despite free bytes. PagedAttention fixes this by using fixed-size blocks and a block table indirection.
+
 ### **3.2. The Scalability Challenge & PagedAttention**
 
 Managing this linearly growing cache for hundreds of concurrent requests with variable and unpredictable sequence lengths leads to massive **memory fragmentation** in a traditional contiguous allocation scheme.
@@ -345,6 +462,55 @@ Managing this linearly growing cache for hundreds of concurrent requests with va
 ![page.png](page.png)
 
 **How PagedAttention Works**: Inspired by OS virtual memory, PagedAttention divides the logical KV cache of each request into fixed-size blocks (e.g., holding 16 tokens). These blocks can be non-contiguously scattered in physical GPU memory. A per-request **block table** maps the logical token order to physical blocks. This eliminates external fragmentation, enables efficient sharing of common prefixes (like system prompts), and allows the memory allocator to work with a simple pool of free blocks.
+
+```mermaid
+flowchart LR
+    subgraph LogicalView [" LOGICAL SEQUENCE (Request X) "]
+        L1["Block 0<br/>tokens 0-15"] --> L2["Block 1<br/>tokens 16-31"];
+        L2 --> L3["Block 2<br/>tokens 32-47"];
+    end
+
+    subgraph PhysicalGPU [" PHYSICAL GPU MEMORY "]
+        P1["Block 7"]:::free
+        P2["Block 2"]:::free
+        P3["Block 19"]:::used
+        P4["Block 4"]:::free
+    end
+
+    L1 -."block_table[0] → 7".-> P1
+    L2 -."block_table[1] → 19".-> P3
+    L3 -."block_table[2] → 4".-> P4
+
+    subgraph AttentionStep [" DECODE STEP EXECUTION "]
+        Q["Query t₍k₎"] ==> G["Gather KV by<br/>block table"];
+        G ==> A["Attention on<br/>gathered KV"];
+        A ==> U["Write K,V of t₍k₎<br/>into last block"];
+    end
+
+    P1 ==> G
+    P3 ==> G
+    P4 ==> G
+
+    linkStyle default stroke:#333,stroke-width:2px
+
+    style LogicalView fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style PhysicalGPU fill:#f3e5f5,stroke:#7b1fa2,stroke-width:3px,color:#000
+    style AttentionStep fill:#e8f5e9,stroke:#388e3c,stroke-width:3px,color:#000
+    style L1 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style L2 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style L3 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style Q fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style G fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style A fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style U fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+
+    classDef used fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000;
+    classDef free fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000;
+    class P3 used;
+    class P1,P2,P4 free;
+```
+
+**Iterative takeaway**: every decode step only appends into the current tail block; when it fills, the allocator pops one free block and updates a single entry in the block table—no massive copies or defragmentation passes.
 
 ```python
 # PagedAttention Core Data Structures
@@ -473,43 +639,63 @@ total_cache = seq_len * cache_per_token / (1024**3)  # Convert to GB (1 GB = 102
 
 ```mermaid
 graph TD
-    subgraph Cache_Sizing [KV Cache Memory Breakdown]
+    subgraph Cache_Sizing [" KV CACHE MEMORY BREAKDOWN "]
         direction LR
-        Input_Node[Input Parameters] --> Formula[Cache Size Formula];
+        Input_Node["Input<br/>Parameters"] --> Formula["Cache Size<br/>Formula"];
 
-        subgraph Input_Subgraph [Model Configuration]
+        subgraph Input_Subgraph [" Model Configuration "]
             L["L = 32 layers"]
             H["H_kv = 8 heads"]
             Dh["D_h = 128 dim"]
             Bytes["2 bytes (FP16)"]
         end
 
-        Formula --> PerToken["Per Token: 128 KB"];
-        PerToken --> SeqLen[Sequence Length];
+        Formula --> PerToken["Per Token:<br/>128 KB"];
+        PerToken --> SeqLen["Sequence<br/>Length"];
 
-        subgraph SeqLen [Varying Sequence Lengths]
-            S1["S = 512 tokens → 64 MB"]
-            S2["S = 1024 tokens → 128 MB"]
-            S3["S = 2048 tokens → 256 MB"]
-            S4["S = 4096 tokens → 512 MB"]
+        subgraph SeqLen [" Varying Sequence Lengths "]
+            S1["S = 512<br/>→ 64 MB"]
+            S2["S = 1024<br/>→ 128 MB"]
+            S3["S = 2048<br/>→ 256 MB"]
+            S4["S = 4096<br/>→ 512 MB"]
         end
 
-        SeqLen --> Batch[Batch Scaling];
+        SeqLen --> Batch["Batch<br/>Scaling"];
 
-        subgraph Batch [Batch Size Impact]
-            B1["Batch = 1 → 256 MB"]
-            B2["Batch = 4 → 1 GB"]
-            B3["Batch = 16 → 4 GB"]
-            B4["Batch = 64 → 16 GB"]
+        subgraph Batch [" Batch Size Impact "]
+            B1["Batch = 1<br/>→ 256 MB"]
+            B2["Batch = 4<br/>→ 1 GB"]
+            B3["Batch = 16<br/>→ 4 GB"]
+            B4["Batch = 64<br/>→ 16 GB"]
         end
 
-        Batch --> Conclusion["Conclusion: Cache dominates<br/>memory at scale"];
+        Batch --> Conclusion["Conclusion:<br/>Cache dominates<br/>memory at scale"];
     end
 
-    style Input_Node fill:#2d3748
-    style SeqLen fill:#805ad5
-    style Batch fill:#f56565
-    style Conclusion fill:#48bb78
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Cache_Sizing fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style Input_Node fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style Formula fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style Input_Subgraph fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+    style L fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style H fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Dh fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Bytes fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style PerToken fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style SeqLen fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style SeqLen fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S1 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S2 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S3 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S4 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Batch fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Batch fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#000
+    style B1 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style B2 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style B3 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style B4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style Conclusion fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
 
 ```
 
@@ -640,65 +826,120 @@ The core of the engine is a loop that schedules requests, prepares a batch, runs
 
 ```mermaid
 flowchart TD
-    Start[Start Inference Step] --> Schedule{Scheduler};
+    Start["Start<br/>Inference Step"] ==> Schedule{Scheduler};
 
-    subgraph Schedule [Scheduling Phase]
+    subgraph Schedule [" SCHEDULING PHASE "]
         direction TB
-        S1[Check Waiting Queue] --> S2[Prioritize Requests];
-        S2 --> S3[Check Cache Availability];
-        S3 --> S4[Allocate KV Cache Blocks];
-        S4 --> S5[Move to Running Queue];
+        S1["Check<br/>Waiting Queue"] --> S2["Prioritize<br/>Requests"];
+        S2 --> S3["Check Cache<br/>Availability"];
+        S3 --> S4["Allocate KV<br/>Cache Blocks"];
+        S4 --> S5["Move to<br/>Running Queue"];
     end
 
-    Schedule --> Batch{Request Types?};
+    Schedule ==> Batch{"Request<br/>Types?"};
 
-    Batch -->|Prefill Only| Prefill[Prefill Batch];
-    Batch -->|Decode Only| Decode[Decode Batch];
-    Batch -->|Mixed| Mixed[Mixed Batch];
+    Batch ==>|"Prefill Only"| Prefill["Prefill<br/>Batch"];
+    Batch ==>|"Decode Only"| Decode["Decode<br/>Batch"];
+    Batch ==>|"Mixed"| Mixed["Mixed<br/>Batch"];
 
-    Prefill --> Model[Model Forward Pass];
-    Decode --> Model;
-    Mixed --> Model;
+    Prefill ==> Model["Model Forward Pass"];
+    Decode ==> Model;
+    Mixed ==> Model;
 
-    subgraph Model [Model Execution]
-        M1[Input Embeddings] --> M2[Transformer Layers];
+    subgraph Model [" MODEL EXECUTION "]
+        M1["Input<br/>Embeddings"] --> M2["Transformer<br/>Layers"];
 
-        subgraph M2 [Paged Attention in Layer L]
-            M3[Block Table Lookup];
-            M4[Gather KV Cache];
-            M5[Compute Attention];
-            M6[Update Cache];
+        subgraph M2 [" Paged Attention in Layer L "]
+            M3["Block Table<br/>Lookup"];
+            M4["Gather<br/>KV Cache"];
+            M5["Compute<br/>Attention"];
+            M6["Update<br/>Cache"];
         end
 
-        M2 --> M7[Output Logits];
+        M2 --> M7["Output<br/>Logits"];
     end
 
-    Model --> Sample[Sampling];
+    Model ==> Sample[Sampling];
 
-    subgraph Sample [Next Token Selection]
-        S6[Apply Temperature];
-        S7[Top-k/Top-p Filtering];
-        S8[Random Sampling];
+    subgraph Sample [" NEXT TOKEN SELECTION "]
+        S6["Apply<br/>Temperature"];
+        S7["Top-k/Top-p<br/>Filtering"];
+        S8["Random<br/>Sampling"];
     end
 
-    Sample --> Update[Update Requests];
+    Sample ==> Update["Update Requests"];
 
-    subgraph Update [State Update]
-        U1[Append New Tokens];
-        U2[Update KV Cache];
-        U3[Check Completion];
-        U4[Update Metrics];
+    subgraph Update [" STATE UPDATE "]
+        U1["Append<br/>New Tokens"];
+        U2["Update<br/>KV Cache"];
+        U3["Check<br/>Completion"];
+        U4["Update<br/>Metrics"];
     end
 
-    Update --> Cleanup[Cleanup Finished];
-    Cleanup --> End[End Step];
+    Update ==> Cleanup["Cleanup<br/>Finished"];
+    Cleanup ==> End["End<br/>Step"];
 
-    style Schedule fill:#805ad5
-    style Model fill:#48bb78
-    style Sample fill:#f56565
-    style Update fill:#d69e2e
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Start fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style End fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Schedule fill:#f3e5f5,stroke:#7b1fa2,stroke-width:3px,color:#000
+    style Model fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Sample fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style Update fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style S1 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S2 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S3 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S4 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style S5 fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Batch fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Prefill fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style Decode fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style Mixed fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style M1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style M2 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style M3 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style M4 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style M5 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style M6 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style M7 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style S6 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style S7 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style S8 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style U1 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style U2 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style U3 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style U4 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Cleanup fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
 
 ```
+
+#### **4.2.1 Continuous Batching Timeline (Iterative View)**
+
+This gantt-style view shows how prefill and decode for mixed requests interleave over time while sharing KV Cache blocks.
+
+```mermaid
+gantt
+    dateFormat  X
+    axisFormat  %L ms
+    title Continuous Batching Timeline: Overlapping Requests
+    
+    section Request A (512 tokens)
+    Prefill A (45ms)     :done, a1, 0, 45
+    Decode A (100 tokens):active, a2, 45, 145
+    
+    section Request B (64 tokens)
+    Waiting             :done, b0, 10, 15
+    Prefill B (6ms)     :done, b1, 15, 21
+    Decode B (50 tokens):active, b2, 21, 71
+    
+    section Request C (256 tokens)
+    Waiting             :done, c0, 20, 25
+    Prefill C (22ms)    :done, c1, 25, 47
+    Decode C (150 tokens):active, c2, 47, 197
+```
+
+**Reading the timeline**: Prefills bunch together early (0–3 ms) because they are compute-heavy and easy to batch; decodes then interleave as short steps (single-token) driven by KV cache bandwidth. The scheduler keeps all three requests alive by alternating decode slots, maximizing GPU occupancy without blowing up KV memory.
 
 ### **4.3. Simplified Engine Step Implementation**
 

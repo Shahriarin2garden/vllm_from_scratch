@@ -25,12 +25,12 @@ flowchart LR
     subgraph TRAINING [" TRAINING PIPELINE "]
         direction TB
         T_INPUT["Input x<br/>(Batch of sequences)"]
-        T_PARAMS1["Params θ₁<br/>(Weights)"]
+        T_PARAMS1["Params theta1<br/>(Weights)"]
         T_HIDDEN["Hidden h<br/>(Activations)"]
-        T_PARAMS2["Params θ₂<br/>(More weights)"]
+        T_PARAMS2["Params theta2<br/>(More weights)"]
         T_OUTPUT["Output y<br/>(Predictions)"]
         T_LOSS["Loss J<br/>(Cross-entropy)"]
-        T_BACKWARD["⟲ Backward Pass<br/>(Gradients ∇θ)"]
+        T_BACKWARD["(Backward Pass)<br/>(Gradients grad theta)"]
         T_OPTIMIZER["Optimizer<br/>(AdamW states)"]
         
         T_INPUT ==> T_HIDDEN
@@ -47,12 +47,12 @@ flowchart LR
     subgraph INFERENCE [" INFERENCE PIPELINE "]
         direction TB
         I_INPUT["Input x<br/>(Single prompt)"]
-        I_PARAMS1["Params θ₁<br/>(Frozen weights)"]
+        I_PARAMS1["Params theta1<br/>(Frozen weights)"]
         I_HIDDEN["Hidden h<br/>(+ KV Cache)"]
-        I_PARAMS2["Params θ₂<br/>(Frozen weights)"]
+        I_PARAMS2["Params theta2<br/>(Frozen weights)"]
         I_OUTPUT["Output y<br/>(Next token)"]
         I_SAMPLE["Sampling<br/>(Argmax/Top-k)"]
-        I_LOOP["⟳ Autoregressive<br/>Loop"]
+        I_LOOP["(Autoregressive Loop)"]
         
         I_INPUT ==> I_HIDDEN
         I_PARAMS1 ==> I_HIDDEN
@@ -110,9 +110,9 @@ flowchart TB
         
         subgraph SCHED_FEATURES [" "]
             direction TB
-            SF1["• Dynamic batch formation<br/>  (prefill + decode mix)"]
-            SF2["• Resource-aware<br/>  admission control"]
-            SF3["• Priority-based queuing<br/>  (FCFS, SJF, Priority)"]
+            SF1["- Dynamic batch formation<br/>  (prefill + decode mix)"]
+            SF2["- Resource-aware<br/>  admission control"]
+            SF3["- Priority-based queuing<br/>  (FCFS, SJF, Priority)"]
         end
         
         SCHEDULER -.-> SCHED_FEATURES
@@ -161,15 +161,18 @@ flowchart TB
 ### 1. **Continuous Batching with Mixed-Phase Execution**
 
 Traditional serving processes one request at a time. We implement **continuous batching**, where the engine dynamically composes batches containing both:
+
 - **Prefill requests**: Processing initial prompts (compute-bound, O(n²) attention)
 - **Decode requests**: Generating new tokens (memory-bound, O(n) cache lookups)
 
 **System Impact:**
+
 - GPU utilization: 30% → 85%+
 - Throughput: 10-15× improvement
 - Enables sub-second time-to-first-token (TTFT) even under load
 
 **Technical Challenge:** Balancing heterogeneous workloads requires:
+
 - Chunked prefill (breaking long prompts into segments)
 - Priority scheduling (preventing decode starvation)
 - Preemption and swapping mechanisms
@@ -179,12 +182,14 @@ Traditional serving processes one request at a time. We implement **continuous b
 The Key-Value (KV) cache accounts for **60-80% of dynamic memory** during inference. Naïve contiguous allocation leads to 30-50% fragmentation. We implement **PagedAttention**, adapting virtual memory concepts from operating systems:
 
 **Key Mechanisms:**
+
 - **Block-Level Granularity**: Split logical KV cache into fixed-size blocks (e.g., 16 tokens)
 - **Indirect Addressing**: Per-request block tables map logical → physical memory
 - **Copy-on-Write**: Share common prefix blocks (e.g., system prompts) across requests
 - **Dynamic Allocation**: Pool-based allocator for zero external fragmentation
 
 **Memory Efficiency:**
+
 ```python
 # Example: 64 concurrent requests, 2048 token context, Llama-3-8B
 Traditional allocation:  64 × 2048 × 128KB = 16.7 GB (with 40% fragmentation)
@@ -214,21 +219,25 @@ Autoregressive generation creates two fundamentally different execution phases:
 Upon completing these labs, you will be able to:
 
 ### **Systems Design**
+
 - ✅ Architect high-throughput serving systems for autoregressive workloads
 - ✅ Design memory subsystems for variable-length, dynamic allocation patterns
 - ✅ Implement OS-level concepts (paging, virtual memory) in GPU contexts
 
 ### **Performance Engineering**
+
 - ✅ Profile and identify bottlenecks in memory-bound vs compute-bound workloads
 - ✅ Apply kernel fusion, quantization, and batching optimizations
 - ✅ Measure and optimize for production metrics: P50/P99 latency, throughput, cost/token
 
 ### **Implementation Skills**
+
 - ✅ Build a functional inference engine from scratch in PyTorch
 - ✅ Implement attention mechanisms with KV caching
 - ✅ Design schedulers for continuous batching and preemption
 
 ### **Production Readiness**
+
 - ✅ Understand trade-offs: throughput vs latency, memory vs compute
 - ✅ Design for fault tolerance (request timeouts, OOM handling)
 - ✅ Implement observability: metrics, tracing, and debugging
@@ -240,8 +249,10 @@ Upon completing these labs, you will be able to:
 Our hands-on labs are sequenced to build understanding incrementally, from computational fundamentals to system-level orchestration:
 
 ### **[Lab 0.1: From Text to Tensors – The Inference Computational Graph](lab0.1/README.md)**
+
 **Scope:** Foundational data pipeline and computational graph structure  
 **Key Topics:**
+
 - Tokenization and embedding lookup
 - Training vs inference computational graph comparison
 - KV cache mathematical necessity and memory footprint analysis
@@ -252,8 +263,10 @@ Our hands-on labs are sequenced to build understanding incrementally, from compu
 ---
 
 ### **[Lab 0.2: Prefill vs. Decode – The Two-Phase Engine](lab0.2/README.md)**
+
 **Scope:** Understanding and orchestrating the two execution phases  
 **Key Topics:**
+
 - Autoregressive generation loop and sequential dependencies
 - Compute-bound prefill: parallelizing prompt processing
 - Memory-bound decode: optimizing single-token generation
@@ -265,8 +278,10 @@ Our hands-on labs are sequenced to build understanding incrementally, from compu
 ---
 
 ### **[Lab 0.3: The Heart of the Matter – KV Cache & Attention](lab0.3/README.md)**
+
 **Scope:** Production-grade memory management and attention optimization  
 **Key Topics:**
+
 - Evolution from naïve to paged cache allocation
 - PagedAttention algorithm and block table implementation
 - Memory fragmentation analysis and mitigation
@@ -280,7 +295,9 @@ Our hands-on labs are sequenced to build understanding incrementally, from compu
 ## Why This Matters: Production Context
 
 ### Real-World Impact
+
 Modern LLM serving at scale (e.g., ChatGPT, Claude, Gemini) requires infrastructure that can:
+
 - Handle **10,000+ concurrent users** with <1s latency
 - Serve **100M+ tokens/day** with predictable costs
 - Support **context windows of 32k-200k tokens**
@@ -289,13 +306,17 @@ Modern LLM serving at scale (e.g., ChatGPT, Claude, Gemini) requires infrastruct
 These systems are built on the exact architectural principles we implement in nano-vLLM.
 
 ### Cost Implications
+
 For a production deployment:
+
 - **Without optimization**: 8× A100 GPUs (80GB) = $24/hour × 24 × 30 = **$17,280/month**
 - **With vLLM-style optimization**: 2× A100 GPUs = **$4,320/month**
 - **Effective savings**: **~75% infrastructure cost reduction**
 
 ### Industry Adoption
+
 Companies using these techniques:
+
 - **Anyscale** (vLLM creators): 10-20× throughput improvements
 - **Together.ai**: Sub-second inference for 70B models
 - **Fireworks.ai**: 4× speedup over baseline serving
@@ -306,11 +327,13 @@ Companies using these techniques:
 ## Getting Started
 
 ### Prerequisites
+
 - **Required**: Strong understanding of deep learning, transformers, and Python
 - **Recommended**: Familiarity with CUDA, memory hierarchies, and distributed systems
 - **Hardware**: NVIDIA GPU with 16GB+ VRAM (RTX 4090, A100, H100, etc.)
 
 ### Quick Start
+
 ```bash
 # Clone repository
 git clone https://github.com/Shahriarin2garden/vllm_from_scratch.git
@@ -334,12 +357,14 @@ cd lab0.1
 ## Technical Stack
 
 **Core Technologies:**
+
 - **PyTorch 2.0+**: For model execution and torch.compile optimization
 - **CUDA**: Custom kernels for attention and memory operations
 - **Python 3.10+**: Primary implementation language
 - **Triton**: For writing optimized GPU kernels
 
 **Key Libraries:**
+
 - **Hugging Face Transformers**: Model loading and tokenization
 - **FlashAttention**: Efficient attention implementation
 - **vLLM**: Reference implementation for comparison
@@ -363,16 +388,19 @@ Expected performance targets after completing the labs:
 ## Additional Resources
 
 ### Reference Implementations
+
 - **[vLLM Official Repository](https://github.com/vllm-project/vllm)** - Production inference engine
 - **[nano-vLLM by GeeeekExplorer](https://github.com/GeeeekExplorer/nano-vllm)** - Simplified educational implementation
 - **[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)** - NVIDIA's optimized runtime
 
 ### Research Papers
+
 - **[Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)** - vLLM foundational paper
 - **[FlashAttention: Fast and Memory-Efficient Exact Attention](https://arxiv.org/abs/2205.14135)**
 - **[Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu)**
 
 ### Community & Support
+
 - **GitHub Issues**: Report bugs and request features
 - **Discussions**: Ask questions and share insights
 - **Contributing**: Pull requests welcome for improvements
@@ -382,16 +410,19 @@ Expected performance targets after completing the labs:
 ## Project Roadmap
 
 ### Completed
+
 - ✅ Lab 0.1: Inference computational graph
 - ✅ Lab 0.2: Two-phase execution model  
 - ✅ Lab 0.3: KV cache and PagedAttention
 
 ### In Progress
+
 - 🔄 Lab 0.4: Advanced scheduling algorithms
 - 🔄 Lab 0.5: Multi-GPU distributed inference
 - 🔄 Lab 0.6: Quantization and optimization
 
 ### Planned
+
 - 📋 Lab 0.7: Production deployment and monitoring
 - 📋 Lab 0.8: Fault tolerance and error handling
 - 📋 Benchmarking suite and profiling tools
@@ -401,6 +432,7 @@ Expected performance targets after completing the labs:
 ## Who Should Use This
 
 **You should work through these labs if you:**
+
 - Are building or maintaining LLM serving infrastructure
 - Want to contribute to projects like vLLM, TensorRT-LLM, or TGI
 - Need to optimize inference costs at scale
@@ -408,6 +440,7 @@ Expected performance targets after completing the labs:
 - Want deep understanding beyond "pip install vllm"
 
 **This is probably not for you if:**
+
 - You only need to use existing inference frameworks (just use vLLM directly)
 - You're looking for application-level LLM tutorials
 - You don't have access to GPU hardware for testing
@@ -423,6 +456,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Acknowledgments
 
 This project is inspired by and builds upon:
+
 - **vLLM team** at UC Berkeley and Anyscale for the groundbreaking research
 - **nano-vLLM** by GeeeekExplorer for the educational foundation
 - **PyTorch team** for the excellent framework and optimization tools
