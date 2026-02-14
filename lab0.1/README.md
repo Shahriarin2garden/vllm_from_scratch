@@ -1195,6 +1195,226 @@ class NanoVLLMEngine:
 
 ```
 
+### **4.4 Visual Addendum: Iterative Diagrams (Production-Grade Style)**
+
+These visuals mirror the main README palette and focus on the most failure-prone or memory-heavy loops. Each diagram is paired with a one-line system takeaway.
+
+#### 4.4.1 PagedAttention Block Lifecycle
+
+```mermaid
+flowchart TD
+    subgraph Allocate [" ALLOCATE (Prefill start) "]
+        A1["Need blocks for seq_len S"] --> A2["blocks = ceil(S / block_size)"];
+        A2 --> A3{"Enough free blocks?"};
+        A3 -->|No| A4["Stay WAITING<br/>(retry next step)"];
+        A3 -->|Yes| A5["Pop N blocks<br/>from free_pool"];
+        A5 --> A6["Init block_table<br/>[b0, b1, ...]"];
+    end
+
+    subgraph DecodeStep [" DECODE STEP (per token) "]
+        D1["Query tₖ"] ==> D2["Block table lookup"];
+        D2 ==> D3["Gather KV from blocks"];
+        D3 ==> D4["Attention output"];
+        D4 ==> D5{"Tail block full?"};
+        D5 -->|No| D6["Append K,V to tail"];
+        D5 -->|Yes| D7["Pop new block<br/>append to table"];
+    end
+
+    subgraph Free [" FREE (request complete) "]
+        F1["Refcount-- for each block"] --> F2{"refcount == 0?"};
+        F2 -->|Yes| F3["Return to free_pool"];
+        F2 -->|No| F4["Keep for shared prefix"];
+    end
+
+    Allocate ==> DecodeStep
+    DecodeStep ==> Free
+
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Allocate fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style DecodeStep fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Free fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style A1 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style A2 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style A3 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style A4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style A5 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style A6 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style D1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D3 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style D4 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style D5 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style D6 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style D7 fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style F1 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style F2 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style F3 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style F4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+```
+
+**Takeaway:** Allocation, steady-state decode, and free are O(1) deque ops—zero fragmentation is why PagedAttention scales.
+
+#### 4.4.2 Scheduler: Prefill vs Decode Decision Tree
+
+```mermaid
+flowchart TD
+    Start["Step N begins"] ==> Q1{"Running batch full?"};
+    Q1 -->|Yes| AdmitNone["Admit 0 new"];
+    Q1 -->|No| Pull["Sort waiting by prompt len / priority"];
+
+    Pull --> CheckMem{"Enough KV blocks<br/>for next request?"};
+    CheckMem -->|No| StopAdmit["Stop admitting"];
+    CheckMem -->|Yes| Admit["Allocate blocks<br/>move to running"];
+    Admit --> Mix{"Batch mix?"};
+
+    Mix -->|Prefill only| Prefill["Build prefill batch"];
+    Mix -->|Decode only| Decode["Build decode batch"];
+    Mix -->|Mixed| Split["Split into two passes"];
+
+    Prefill ==> Exec["Model forward"];
+    Decode ==> Exec;
+    Split ==> Exec;
+
+    Exec ==> Sample["Sample tokens"];
+    Sample ==> Update["Update states + KV"];
+    Update ==> Complete{"EOS / max_tokens?"};
+    Complete -->|Yes| Free["Free blocks, return output"];
+    Complete -->|No| Loop["Continue next step"];
+
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Start fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style Q1 fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Pull fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style CheckMem fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style StopAdmit fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style Admit fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Mix fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Prefill fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style Decode fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style Split fill:#ce93d8,stroke:#7b1fa2,stroke-width:2px,color:#000
+    style Exec fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Sample fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style Update fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style Complete fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style Free fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Loop fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+```
+
+**Takeaway:** Mixed batches are handled as two passes; admissions halt as soon as KV blocks are insufficient—this keeps TTFT predictable.
+
+#### 4.4.3 Sampling Pipeline (Temperature → Top-k/p → Multinomial)
+
+```mermaid
+flowchart TD
+    Logits["Logits [V=50k]"] --> Temp["Divide by temperature T"];
+    Temp --> TopK{"top_k > 0?"};
+    TopK -->|Yes| KPrune["Keep top_k
+set rest = -∞"];
+    TopK -->|No| SkipK["Skip top-k"];
+    KPrune --> TopP;
+    SkipK --> TopP;
+
+    TopP{"top_p < 1?"} -->|Yes| PPrune["Sort by prob
+cumsum > p → -∞"];
+    TopP -->|No| SkipP["Skip top-p"];
+    PPrune --> Softmax;
+    SkipP --> Softmax;
+
+    Softmax["Softmax → probs"] --> Sample["Multinomial sample"];
+    Sample --> Checks{"EOS / stop seq?"};
+    Checks -->|Yes| End["Finish request"];
+    Checks -->|No| Append["Append token
+continue decode"];
+
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Logits fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style Temp fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style TopK fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style KPrune fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style SkipK fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style TopP fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style PPrune fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style SkipP fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Softmax fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style Sample fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+    style Checks fill:#bbdefb,stroke:#1976d2,stroke-width:2px,color:#000
+    style End fill:#ffcdd2,stroke:#c62828,stroke-width:2px,color:#000
+    style Append fill:#c5e1a5,stroke:#689f38,stroke-width:2px,color:#000
+```
+
+**Takeaway:** Sampling is CPU/GPU-cheap; its main job is pruning the candidate set so decode remains deterministic under load.
+
+#### 4.4.4 KV Cache Growth vs Block Size (What-if)
+
+```mermaid
+flowchart TD
+    subgraph Params [" Choose block_size " ]
+        P1["block_size = 8"]
+        P2["block_size = 16"]
+        P3["block_size = 32"]
+    end
+
+    subgraph Growth [" 64-token request (per layer, KV heads grouped) "]
+        G1["Needs 8 blocks"]
+        G2["Needs 4 blocks"]
+        G3["Needs 2 blocks"]
+    end
+
+    subgraph Overhead [" Tail waste when finishing mid-block " ]
+        O1["Worst-case waste: 7 slots"]
+        O2["Worst-case waste: 15 slots"]
+        O3["Worst-case waste: 31 slots"]
+    end
+
+    Params --> Growth
+    Growth --> Overhead
+
+    linkStyle default stroke:#333,stroke-width:3px
+
+    style Params fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#000
+    style Growth fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Overhead fill:#ffebee,stroke:#c62828,stroke-width:3px,color:#000
+    style P1 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style P2 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style P3 fill:#90caf9,stroke:#1976d2,stroke-width:2px,color:#000
+    style G1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style G2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style G3 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px,color:#000
+    style O1 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style O2 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+    style O3 fill:#ef9a9a,stroke:#c62828,stroke-width:2px,color:#000
+```
+
+**Takeaway:** Smaller blocks reduce waste but increase block-table lookups; 16 tokens/block is a balanced default for Llama-class models.
+
+#### 4.4.5 Request State Machine (Operational View)
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING: New request arrives
+    WAITING --> RUNNING: Blocks allocated + batched
+    WAITING --> CANCELLED: User/timeout
+
+    RUNNING --> RUNNING: Decode token
+    RUNNING --> FINISHED: EOS / max_tokens / stop_seq
+    RUNNING --> CANCELLED: User stop
+    RUNNING --> WAITING: Preempt (experimental)
+
+    FINISHED --> [*]: Free blocks, return output
+    CANCELLED --> [*]: Free blocks, return error
+
+    note right of RUNNING
+      Has block_table
+      Lives in batch mix
+      KV grows linearly
+    end note
+```
+
+**Takeaway:** Only RUNNING owns GPU cache; preemption (if enabled) must serialize KV to host to requeue safely.
+
 ## **📝 Lab Summary & Key Takeaways**
 
 - **Inference is a Subset Graph**: The serving pipeline is a **strict, forward-only subset** of the training computational graph. It eliminates the backward pass, gradients, and optimizer states, fundamentally changing the system bottlenecks from compute to memory.
