@@ -536,7 +536,7 @@ sequenceDiagram
     Note over ReqB: Prefill: 3 tokens
     ReqB->>GPU_Mem: Allocate KV rows t₁–t₃ (finds gap or tail)
 
-    Note over GPU_Mem: ⚠️ Without paging:<br/>Mixed-length gaps appear as<br/>requests finish; new requests<br/>struggle to find contiguous chunks
+    Note over GPU_Mem: ⚠️ Without paging: Mixed-length gaps appear as requests finish; new requests struggle to find contiguous chunks
 ```
 
 ### 3.4 Cache Memory Calculation
