@@ -1,18 +1,16 @@
-# Untitled
-
-Status: Not started
-
 # Lab 0.1: From Text to Tensors – The Inference Computational Graph
 
-**Navigation:** [← Main](https://www.notion.so/README.md) | [Next: Lab 0.2 →](https://www.notion.so/lab0.2/README.md)
+**Navigation:** [← Main](../README.md) | [Next: Lab 0.2 →](../lab0.2/README.md)
+
+---
 
 ## Introduction
 
-This lab dissects the complete computational pipeline that transforms a raw text prompt into a generated token. You will examine every core data structure and operation in the inference graph, from tokenization through the KV cache to final sampling. Unlike traditional tutorials that present code as a black box, this lab requires you to predict, fill in blanks, and experiment with deliberate failures. The goal is to build a mental model that serves as the foundation for understanding high‑performance inference engines like vLLM.
+This lab dissects the complete computational pipeline that transforms a raw text prompt into a generated token. You will examine every core data structure and operation in the inference graph, from tokenization through the KV cache to final sampling. Unlike traditional tutorials that present code as a black box, this lab requires you to predict, fill in blanks, and experiment with deliberate failures.
 
-The significance of this understanding extends beyond academic interest. As noted in recent research, "speeding up each inference request is instrumental in achieving high throughput and latency at scale" . Production systems must manage the KV cache—the primary dynamic memory consumer—under concurrent request loads, making efficient memory management essential for performance.
+Production systems must manage the KV cache—the primary dynamic memory consumer—under concurrent request loads. Understanding this pipeline is essential for building high-performance inference engines.
 
-**Prerequisites:** Basic Python knowledge, familiarity with neural network concepts, and access to a machine with Python 3.8+ and PyTorch installed (see Environment Setup).
+**Prerequisites:** Basic Python knowledge, familiarity with neural network concepts, and access to a machine with Python 3.8+ and PyTorch installed.
 
 ---
 
@@ -20,21 +18,21 @@ The significance of this understanding extends beyond academic interest. As note
 
 By the end of this lab, you will be able to:
 
-1. **Tokenize** raw text and explain the byte‑pair encoding (BPE) algorithm with reference to its original compression origins .
-2. **Contrast** the training computational graph with the inference graph, identifying why the KV cache is the only dynamic state during inference and how this shift changes system bottlenecks from compute to memory bandwidth .
-3. **Calculate** the memory footprint of the KV cache for a given model and sequence length, understanding why this dominates GPU memory under concurrency .
-4. **Implement** a simplified paged KV cache manager based on the vLLM PagedAttention design to eliminate fragmentation .
-5. **Orchestrate** a minimal inference engine that handles multiple requests with continuous batching, recognizing the distinct characteristics of prefill and decode phases .
+1. **Tokenize** raw text using byte-pair encoding (BPE) and calculate sequence length impact on memory
+2. **Contrast** the training computational graph with the inference graph, identifying the KV cache as the only dynamic state
+3. **Calculate** the memory footprint of the KV cache for a given model configuration and sequence length
+4. **Implement** a paged KV cache manager based on the vLLM PagedAttention design
+5. **Orchestrate** a minimal inference engine that handles multiple requests with continuous batching
 
 ---
 
 ## Prologue: The Challenge
 
-You are a performance engineer at a startup that has just fine‑tuned a 13B parameter language model. Your team wants to offer it as a real‑time API. Early tests show that the model runs, but latency is high and memory usage grows unpredictably. The CTO asks you to investigate: "Why does inference memory blow up after a few requests? How can we serve hundreds of concurrent users?"
+You join the ML infrastructure team at a startup that has fine-tuned a 13B parameter language model. The team wants to offer it as a real-time API. Early tests show that the model runs, but latency is high and memory usage grows unpredictably. After a few concurrent requests, the system runs out of GPU memory.
 
-To answer these questions, you must understand exactly what happens inside the inference engine. Your first task is to map the pipeline from raw text to output tokens, identify the bottlenecks, and propose a memory management strategy. This lab builds that understanding step by step.
+The CTO asks you to investigate: "Why does inference memory blow up after a few requests? How can we serve hundreds of concurrent users?"
 
-As you progress, consider this observation from systems research: "The KV cache grows linearly with respect to the length and number of reasoning chains, as the new key–value representations are appended to it. Hence, it can easily exhaust the memory of the accelerator and slow down each generation step, as attention is memory-bound: its cost is dominated by the time needed to retrieve the cache from memory" . This memory-bound nature is the central challenge you must address.
+Your task is to map the pipeline from raw text to output tokens, identify the bottlenecks, and propose a memory management strategy. This lab builds that understanding step by step.
 
 ---
 
@@ -44,11 +42,11 @@ Create a Python virtual environment and install the required packages:
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install torch transformers numpy
 ```
 
-Create a working directory:
+Create the working directory structure:
 
 ```bash
 mkdir -p lab0.1
@@ -56,11 +54,22 @@ cd lab0.1
 touch tokenizer_demo.py kv_cache_demo.py scheduler_demo.py
 ```
 
-All code examples assume you are working inside this directory.
+Verify PyTorch installation:
+
+```bash
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+```
+
+**Expected output:**
+```
+PyTorch version: 2.x.x
+```
 
 ---
 
 ## Chapter 1: Text to Tokens – The Tokenization Pipeline
+
+The language model does not read characters. It reads integers that represent subword units. The tokenizer converts raw text into these integers, directly affecting sequence length, latency, and inference cost. Understanding tokenization is essential because it determines how much text fits into the model's context window.
 
 ### 1.1 Why Tokenization Matters
 
@@ -76,25 +85,26 @@ The diagram below shows the transformation from raw text to token IDs.
 
 ![1000091400.png](1000091400.png)
 
-### 1.2 Think First: Vocabulary Trade‑offs
+### 1.2 Think First: Vocabulary Trade-offs
 
-**Question:** If a model has a 4096‑token context window, how many English words can it roughly process in one request? How many Japanese characters? (Assume English averages 1.3 tokens/word, Japanese 2–3 tokens/character.)
+**Question:** If a model has a 4096-token context window, how many English words can it roughly process in one request? How many Japanese characters? (Assume English averages 1.3 tokens/word, Japanese 2–3 tokens/character.)
 
 <details>
 <summary>Click to review</summary>
 
-- English: 4096 / 1.3 ≈ 3150 words.
-- Japanese: 4096 / 2.5 ≈ 1638 characters.
+- English: 4096 / 1.3 ≈ 3150 words
+- Japanese: 4096 / 2.5 ≈ 1638 characters
 
-This variability affects system design: an English‑heavy workload can fit longer prompts than a Japanese‑heavy one, even with the same model. The tokenizer's byte-level BPE variant, used in models like GPT-2 and RoBERTa, converts text to UTF-8 first, ensuring any Unicode character can be represented .
+This variability affects system design: an English-heavy workload can fit longer prompts than a Japanese-heavy one, even with the same model. The tokenizer's byte-level BPE variant converts text to UTF-8 first, ensuring any Unicode character can be represented.
 
 </details>
 
 ### 1.3 Anatomy of a Tokenizer
 
-Tokenizers use algorithms like Byte Pair Encoding (BPE) to find a balance between vocabulary size and sequence length. BPE iteratively merges the most frequent adjacent byte pairs in a training corpus.
+Tokenizers use Byte Pair Encoding (BPE) to balance vocabulary size and sequence length. BPE iteratively merges the most frequent adjacent byte pairs in a training corpus, building a vocabulary that compresses text efficiently.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 flowchart TD
     A["Raw User Prompt<br/>'The capital of France is'"] --> B_Node[Text Normalization];
     B_Node --> C_Node[Subword Segmentation];
@@ -121,11 +131,13 @@ flowchart TD
     end
 
     D_Node --> E["Output Tensor<br/>Shape: [seq_len=5]<br/>[1, 307, 2647, 310, 278]"];
-
-    linkStyle default stroke:#333,stroke-width:3px
 ```
 
-### 1.4 BPE Algorithm Implementation
+### 1.4 What You Will Build
+
+You will implement the core BPE vocabulary building algorithm. This algorithm starts with individual bytes and iteratively merges the most frequent pairs to build a compressed vocabulary. Understanding this process reveals why different tokenizers produce different sequence lengths for the same text.
+
+### 1.5 BPE Algorithm Implementation
 
 The following code implements the core logic of BPE. Some parts are missing—fill them in.
 
@@ -185,11 +197,24 @@ new_token_id = len(vocab)
 vocab[best_pair] = new_token_id
 ```
 
-The vocabulary maps either a single byte (as a character) or a tuple of two token IDs to a new token ID. This allows the BPE algorithm to build a hierarchy of merges. Modern implementations like SentencePiece and HuggingFace tokenizers extend this concept with byte-level BPE to handle any Unicode character .
+The vocabulary maps either a single byte (as a character) or a tuple of two token IDs to a new token ID. This allows the BPE algorithm to build a hierarchy of merges. Modern implementations like SentencePiece and HuggingFace tokenizers extend this concept with byte-level BPE to handle any Unicode character.
 
 </details>
 
-### 1.5 From Discrete IDs to Continuous Embeddings
+### 1.6 Understanding BPE Merges
+
+**Question:** Given the text "aaabdaaabac", what would be the first merge BPE performs?
+
+<details>
+<summary>Click to review</summary>
+
+The pair "aa" appears 4 times (most frequent), so BPE would merge it first, creating a new token for "aa". The text becomes: "[aa]abdaaabac" where [aa] is a single token.
+
+This demonstrates why BPE is effective: common patterns get compressed into single tokens, reducing sequence length.
+
+</details>
+
+### 1.7 From Discrete IDs to Continuous Embeddings
 
 Once token IDs are obtained, they are passed through an embedding layer—a simple lookup table that returns a dense vector for each ID. This matrix is one of the largest parameters in the model.
 
@@ -203,7 +228,7 @@ $$E = W[X] \in \mathbb{R}^{B \times S \times D}$$
 
 This indexing operation is a pure, parallelizable memory read. In production systems, the embedding matrix is typically stored in GPU memory and accessed with high bandwidth.
 
-### 1.6 Complete Initial Pipeline
+### 1.8 Complete Initial Pipeline
 
 The following class combines tokenization and embedding. Fill in the missing parts.
 
@@ -268,9 +293,27 @@ class TextToTensorPipeline:
 embeddings = self.embedding(input_ids)
 ```
 
+**Explanation:** The embedding layer is a lookup table. Given token IDs, it returns the corresponding embedding vectors. This is a pure memory operation with no computation.
+
 </details>
 
-### 1.7 Test and Verify
+### 1.9 Understanding Embedding Dimensions
+
+**Question:** If a model has a vocabulary of 50,000 tokens and an embedding dimension of 4096, how much memory does the embedding matrix consume in FP16?
+
+<details>
+<summary>Click to review</summary>
+
+Memory = vocab_size × embedding_dim × bytes_per_param
+= 50,000 × 4,096 × 2 bytes
+= 409,600,000 bytes
+≈ 391 MB
+
+This is one of the largest single parameters in the model. For a 13B parameter model, the embedding matrix alone can consume 2-3% of total memory.
+
+</details>
+
+### 1.10 Test and Verify
 
 Run the following code to see tokenization in practice with a real tokenizer (GPT‑2). First, predict what the output will look like.
 
@@ -304,6 +347,7 @@ Note: The tokenizer adds a leading space before "The" because GPT‑2 was traine
 The diagram below shows how tokenization fits into the broader inference pipeline in production systems like NVIDIA's TensorRT-LLM .
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph TB
     subgraph Tokenization_Pipeline
         direction LR
@@ -318,9 +362,6 @@ graph TB
         E1 --> E2[Positional Encoding<br/>Add position info]
         E2 --> E3[Final Embeddings<br/>to Transformer]
     end
-
-    style Tokenization_Pipeline fill:#e3f2fd
-    style Model_Input fill:#e8f5e9
 ```
 
 ### 1.9 Checkpoint
@@ -332,7 +373,23 @@ graph TB
 - [ ]  I understand that the embedding layer is a simple lookup table.
 - [ ]  I can predict the output of `tokenizer.decode(tokenizer.encode(...))` for a simple sentence.
 
-### 1.10 Experiment: Vocabulary Size Impact
+### 1.11 Tokenization Impact on Inference
+
+**Scenario:** You are serving a multilingual model. English requests average 100 tokens, but Chinese requests average 180 tokens for similar content length.
+
+**Question:** If your GPU can handle batches of 32 requests with 100-token sequences, how many Chinese requests can you batch?
+
+<details>
+<summary>Click to review</summary>
+
+Memory constraint: 32 × 100 = 3,200 total tokens
+Chinese batch size: 3,200 / 180 ≈ 17 requests
+
+This 47% reduction in batch size directly impacts throughput. Production systems must account for tokenizer efficiency when capacity planning.
+
+</details>
+
+### 1.12 Experiment: Vocabulary Size Impact
 
 1. Load a different tokenizer, e.g., `"bert-base-uncased"`, and tokenize the same sentence.
 2. Compare the number of tokens.
@@ -348,6 +405,8 @@ BERT uses WordPiece tokenization, which differs from BPE. You'll likely find tha
 ---
 
 ## Chapter 2: The Inference Graph vs Training Graph
+
+The training computational graph and the inference graph share the same forward pass, but differ fundamentally in memory requirements and bottlenecks. Understanding this distinction is critical for designing efficient serving systems.
 
 ### 2.1 Think First: What's Different in Inference?
 
@@ -370,6 +429,7 @@ As noted in the vLLM paper analysis, "the training graph's memory footprint is d
 The diagram below highlights the divergence.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 flowchart TD
     subgraph Training_Graph [" TRAINING COMPUTATIONAL GRAPH "]
         direction TB
@@ -430,6 +490,7 @@ The table shows that inference can run on hardware an order of magnitude smaller
 This diagram illustrates why inference enables aggressive optimizations like quantization.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph TD
     subgraph Training_Footprint
         direction LR
@@ -445,12 +506,24 @@ graph TD
     end
 
     Training_Footprint -->|"3-4x memory<br/>reduction"| Inference_Footprint
-
-    style Training_Footprint fill:#ffebee
-    style Inference_Footprint fill:#e8f5e9
 ```
 
-### 2.6 Checkpoint
+### 2.6 Understanding Memory Trade-offs
+
+**Question:** A 13B parameter model in FP16 requires 26GB for weights. If you quantize to INT4, how much memory do you save? What is the trade-off?
+
+<details>
+<summary>Click to review</summary>
+
+FP16: 13B × 2 bytes = 26GB
+INT4: 13B × 0.5 bytes = 6.5GB
+Savings: 19.5GB (75% reduction)
+
+Trade-off: Quantization introduces accuracy loss. INT4 quantization typically results in 1-3% degradation in model quality metrics. The decision depends on whether the memory savings justify the quality loss for your use case.
+
+</details>
+
+### 2.7 Checkpoint
 
 **Self-Assessment:**
 
@@ -461,6 +534,8 @@ graph TD
 ---
 
 ## Chapter 3: The KV Cache – Core of Autoregression
+
+The KV cache is the central data structure in autoregressive inference. It stores intermediate attention states to avoid redundant computation. Understanding its growth patterns and memory requirements is essential for capacity planning.
 
 ### 3.1 Think First: Why Can't We Recompute?
 
@@ -483,6 +558,7 @@ As the IEEE characterization paper notes, the KV cache exists "to avoid redundan
 During forward pass, each token's hidden state is projected into query (Q), key (K), and value (V). The KV cache stores K and V from all previous tokens.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 flowchart TD
     subgraph Layer_L [" TRANSFORMER LAYER L "]
         direction TB
@@ -521,6 +597,7 @@ flowchart TD
 The sequence diagram shows how the cache expands and why fragmentation appears without paging.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px','actorBkg':'#3d3d3d','actorBorder':'#7c7c7c','actorTextColor':'#fff','noteBkgColor':'#4a4a4a','noteBorderColor':'#7c7c7c','noteTextColor':'#fff'}}}%%
 sequenceDiagram
     participant GPU_Mem as GPU Memory
     participant ReqA as Request A
@@ -583,6 +660,7 @@ total_cache_bytes = cache_per_token * seq_len
 This diagram shows how cache size scales with sequence length and batch size.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph TD
     subgraph Cache_Sizing [" KV CACHE MEMORY BREAKDOWN "]
         direction LR
@@ -618,15 +696,53 @@ graph TD
     end
 ```
 
-### 3.6 Checkpoint
+### 3.6 Performance Analysis: Cache vs Recomputation
+
+**Scenario:** Compare the computational cost of generating 100 tokens with and without KV caching for a model with 32 layers and 32 attention heads.
+
+**Without cache:**
+- Token 1: Compute attention for 1 token (prompt)
+- Token 2: Recompute attention for 2 tokens
+- Token 3: Recompute attention for 3 tokens
+- ...
+- Token 100: Recompute attention for 100 tokens
+
+Total operations: 1 + 2 + 3 + ... + 100 = 5,050 attention computations
+
+**With cache:**
+- Token 1: Compute attention for 1 token, store K/V
+- Token 2: Compute attention for 1 new token, read 1 cached K/V
+- Token 3: Compute attention for 1 new token, read 2 cached K/V
+- ...
+- Token 100: Compute attention for 1 new token, read 99 cached K/V
+
+Total operations: 100 attention computations (50x reduction)
+
+**Question:** At what sequence length does the memory cost of caching exceed the computational savings?
+
+<details>
+<summary>Click to review</summary>
+
+This depends on hardware characteristics:
+- Memory bandwidth: How fast can you read cached K/V?
+- Compute throughput: How fast can you recompute K/V?
+
+On modern GPUs (A100, H100), memory bandwidth is the bottleneck. The cache is always beneficial because reading cached values is faster than recomputing them, even for very long sequences.
+
+The practical limit is GPU memory capacity, not computational trade-offs.
+
+</details>
+
+### 3.7 Checkpoint
 
 **Self-Assessment:**
 
 - [ ]  I can explain why the KV cache is necessary.
 - [ ]  I can compute the cache size for any model given its configuration.
 - [ ]  I understand that the cache grows linearly with sequence length.
+- [ ]  I can calculate the computational savings from caching vs recomputation.
 
-### 3.7 Experiment: Simulate Cache Growth
+### 3.8 Experiment: Simulate Cache Growth
 
 1. Write a simple Python script that simulates the KV cache growth for multiple requests with random sequence lengths.
 2. Measure how much memory would be wasted if you allocated contiguous blocks for each request (i.e., internal fragmentation due to different lengths).
@@ -641,6 +757,8 @@ The vLLM paper found that "only 20–38% of the allocated KV cache memory is act
 ---
 
 ## Chapter 4: PagedAttention – Solving Fragmentation
+
+Memory fragmentation is the primary obstacle to high-throughput inference. PagedAttention solves this by adapting virtual memory concepts from operating systems to GPU memory management.
 
 ### 4.1 Think First: The Fragmentation Problem
 
@@ -769,6 +887,7 @@ self.free_blocks.append(block_id)
 The block table maps logical token positions to physical block IDs.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 flowchart LR
     subgraph LogicalView [" LOGICAL SEQUENCE (Request X) "]
         L1["Block 0<br/>tokens 0-15"] --> L2["Block 1<br/>tokens 16-31"];
@@ -786,8 +905,8 @@ flowchart LR
     L2 -."block_table[1] → 19".-> P3
     L3 -."block_table[2] → 4".-> P4
 
-    classDef used fill:#a5d6a7
-    classDef free fill:#ffcdd2
+    classDef used fill:#5a5a5a,stroke:#7c7c7c,stroke-width:2px,color:#fff
+    classDef free fill:#4a4a4a,stroke:#7c7c7c,stroke-width:2px,color:#fff
     class P3 used;
     class P1,P2,P4 free;
 ```
@@ -797,6 +916,7 @@ flowchart LR
 The diagram below shows how the PagedAttention kernel accesses blocks during computation, based on the vLLM implementation .
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph TD
     subgraph GPU_Thread_Block ["GPU Thread Block (per head per sequence)"]
         direction TB
@@ -818,8 +938,8 @@ graph TD
         TB6 --> TB7[Write output]
     end
 
-    style GPU_Thread_Block fill:#e3f2fd
-    style Warp_Processing fill:#e8f5e9
+    style GPU_Thread_Block fill:#3d3d3d,stroke:#7c7c7c,stroke-width:2px,color:#fff
+    style Warp_Processing fill:#4a4a4a,stroke:#7c7c7c,stroke-width:2px,color:#fff
 ```
 
 ### 4.6 Block Size Trade-offs
@@ -827,6 +947,7 @@ graph TD
 Block size is a critical tuning parameter. The vLLM paper notes: "A smaller block size reduces internal fragmentation but increases kernel overhead; a larger block size improves kernel efficiency but wastes more memory" .
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph TD
     subgraph Block_Size_Impact ["Block Size Trade-offs"]
         direction LR
@@ -845,10 +966,28 @@ graph TD
         Large --> L3["✓ Smaller block table"]
     end
 
-    style Block_Size_Impact fill:#f3e5f5
+    style Block_Size_Impact fill:#3d3d3d,stroke:#7c7c7c,stroke-width:2px,color:#fff
 ```
 
-### 4.7 Checkpoint
+### 4.7 Understanding Block Allocation
+
+**Question:** A request needs to store 50 tokens. With a block size of 16, how many blocks are allocated? How many token slots are wasted?
+
+<details>
+<summary>Click to review</summary>
+
+Blocks needed: ceil(50 / 16) = 4 blocks
+Total capacity: 4 × 16 = 64 token slots
+Used: 50 tokens
+Wasted: 64 - 50 = 14 tokens (internal fragmentation)
+
+Waste percentage: 14 / 64 = 21.9%
+
+This is the maximum internal fragmentation per request. Across many requests with varying lengths, the average waste is approximately block_size / 2.
+
+</details>
+
+### 4.8 Checkpoint
 
 **Self-Assessment:**
 
@@ -894,6 +1033,7 @@ As the IEEE characterization study notes, "the decision of what batching strateg
 Production systems like NVIDIA's TensorRT-LLM explicitly separate prefill and generation phases .
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 graph LR
     INPUT_PROMPT(Input<br/>Prompt) --> TOKENIZER(Tokenize)
 
@@ -1013,6 +1153,7 @@ class BatchScheduler:
 The following diagram shows the flow of one engine step.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 flowchart TD
     Start["Start<br/>Inference Step"] ==> Schedule{Scheduler};
 
@@ -1181,6 +1322,7 @@ The vLLM kernel documentation describes this process in detail: each thread grou
 This diagram shows the lifecycle of a request through the engine.
 
 ```mermaid
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#3d3d3d','primaryTextColor':'#fff','primaryBorderColor':'#7c7c7c','lineColor':'#7c7c7c','secondaryColor':'#4a4a4a','tertiaryColor':'#3d3d3d','background':'#2d2d2d','mainBkg':'#3d3d3d','secondBkg':'#4a4a4a','textColor':'#fff','fontSize':'14px'}}}%%
 stateDiagram-v2
     [*] --> WAITING: New request arrives
     WAITING --> RUNNING: Blocks allocated + batched
