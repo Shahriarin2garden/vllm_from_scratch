@@ -96,9 +96,10 @@ Because each probability depends on all previous tokens, we cannot compute token
 
 **Question:** If you have a model that can process 1000 tokens in parallel during training, why can’t it generate 1000 tokens in parallel during inference?
 
-- Click to review
-    
-    During training, the entire correct sequence is available, so the model can compute all positions simultaneously using a causal mask. During inference, you don’t know the future tokens; each step’s output depends on the previous step’s sampled token. This creates a data dependency that forces sequential generation.
+<details>
+<summary>Click to review</summary>
+
+During training, the entire correct sequence is available, so the model can compute all positions simultaneously using a causal mask. During inference, you don’t know the future tokens; each step’s output depends on the previous step’s sampled token. This creates a data dependency that forces sequential generation.
     
 
 ### 1.3 Computational Graph Decomposition
@@ -139,9 +140,10 @@ The KV cache eliminates redundant computation, reducing total cost from $O(T^2)$
 
 **Think First:** For a 32‑layer model with hidden size 4096, how many bytes are needed to store the KV cache for a 1000‑token sequence? Assume FP16.
 
-- Click to calculate
-    
-    Each token produces a key and a value vector per layer. For each layer: $2 \times 4096 \times 2$ bytes = 16 KB per token (key + value). For 32 layers: $32 \times 16$ KB = 512 KB per token. For 1000 tokens: 512 MB.
+<details>
+<summary>Click to calculate</summary>
+
+Each token produces a key and a value vector per layer. For each layer: $2 \times 4096 \times 2$ bytes = 16 KB per token (key + value). For 32 layers: $32 \times 16$ KB = 512 KB per token. For 1000 tokens: 512 MB.
     
 
 ### 1.5 GPT Inference Process Diagram
@@ -281,9 +283,10 @@ The diagram below illustrates the two-phase inference engine with modern optimiz
 
 **Predict:** For a 2048‑token sequence and a 7B model (32 layers, hidden size 4096), what is the approximate KV cache size in GB? Use FP16.
 
-- Click to verify
-    
-    Cache size per token = 32 layers × 2 (key+value) × 4096 × 2 bytes = 32 × 2 × 4096 × 2 = 524,288 bytes ≈ 0.5 MB.
+<details>
+<summary>Click to verify</summary>
+
+Cache size per token = 32 layers × 2 (key+value) × 4096 × 2 bytes = 32 × 2 × 4096 × 2 = 524,288 bytes ≈ 0.5 MB.
     
     For 2048 tokens: 2048 × 0.5 MB = 1024 MB = 1 GB.
     
@@ -313,9 +316,10 @@ The prefill phase processes the user’s prompt in one shot. Because the entire 
 
 **Question:** Why is prefill able to use parallelism while decode cannot?
 
-- Click to review
-    
-    Prefill has all tokens available simultaneously, so it can compute attention scores for all positions in parallel using matrix multiplication. Decode must compute one token at a time because each new token depends on the previous one.
+<details>
+<summary>Click to review</summary>
+
+Prefill has all tokens available simultaneously, so it can compute attention scores for all positions in parallel using matrix multiplication. Decode must compute one token at a time because each new token depends on the previous one.
     
 
 ### 2.3 Prefill Phase Data Flow Diagram
@@ -590,9 +594,10 @@ graph TD
 
 **Predict:** For a prompt of 512 tokens and a model with 4096 hidden size, will prefill be compute‑bound or memory‑bound on an A100 (peak compute 312 TFLOPS, bandwidth 1.5 TB/s)? Assume arithmetic intensity threshold ≈ 100 FLOPs/byte.
 
-- Click to verify
-    
-    Compute‑bound. Arithmetic intensity ~ $S$ = 512, which is well above 100. The GPU will spend most of its time computing, not waiting for memory.
+<details>
+<summary>Click to verify</summary>
+
+Compute‑bound. Arithmetic intensity ~ $S$ = 512, which is well above 100. The GPU will spend most of its time computing, not waiting for memory.
     
 
 ### 2.14 Experiment: Measure Arithmetic Intensity
@@ -650,9 +655,13 @@ After the prompt is processed, the model enters the decode phase. It generates o
 
 **Question:** In the decode step, you need to load the model weights and the entire KV cache. How many bytes are moved for a model with 7B parameters (FP16) and a KV cache of 1000 tokens (each token contributes key and value vectors of size $d_{\text{model}}$ per layer)? Assume 32 layers, hidden size 4096.
 
-- Click to review
-    - Model weights: $7B \times 2$ bytes ≈ 14 GB.
+<details>
+<summary>Click to review</summary>
+
+- Model weights: $7B \times 2$ bytes ≈ 14 GB.
     - KV cache: As computed earlier, 512 MB. So total ≈ 14.5 GB moved per decode step. The computation performed is only a few GFLOPS, leading to an arithmetic intensity < 1. Hence memory‑bound.
+
+</details>
 
 ### 3.3 Decode Phase Data Flow Diagram
 
@@ -885,9 +894,10 @@ graph LR
 
 **Predict:** If you run decode for 100 steps, how does the time per step change? Why?
 
-- Click to verify
-    
-    The time per step increases slightly because the KV cache grows, so more data must be read from memory each time. However, the increase is sublinear because the attention computation is $O(t \cdot d)$ and memory movement is $O(t \cdot d)$ as well. The dominating factor is still the model weights, so the increase may be modest.
+<details>
+<summary>Click to verify</summary>
+
+The time per step increases slightly because the KV cache grows, so more data must be read from memory each time. However, the increase is sublinear because the attention computation is $O(t \cdot d)$ and memory movement is $O(t \cdot d)$ as well. The dominating factor is still the model weights, so the increase may be modest.
     
 
 ### 3.10 Checkpoint
@@ -916,9 +926,13 @@ A production server handles many requests simultaneously. Some are in prefill (p
 
 **Question:** Why can’t we simply run all waiting requests together in one giant batch?
 
-- Click to review
-    - Different requests are at different phases (prefill vs decode) and have different lengths. Mixing them naively would waste computation (e.g., padding short sequences) or cause high latency (a long prefill blocking many decodes).
+<details>
+<summary>Click to review</summary>
+
+- Different requests are at different phases (prefill vs decode) and have different lengths. Mixing them naively would waste computation (e.g., padding short sequences) or cause high latency (a long prefill blocking many decodes).
     - The total number of tokens that can be processed in one iteration is limited by GPU memory and compute capacity.
+
+</details>
 
 ### 4.3 Scheduling Algorithms
 
@@ -1009,6 +1023,8 @@ class Request:
         self.state = 'prefill'   # or 'decode'
         self.done = False
 
+</details>
+
 class Scheduler:
     def __init__(self, token_budget):
         self.budget = token_budget
@@ -1063,9 +1079,10 @@ Different frameworks implement continuous batching with variations [12,13,14]:
 
 **Predict:** If you have two requests: A (prompt 100, output 10) and B (prompt 10, output 100), and a token budget of 50, which request will finish first under your scheduler? Why?
 
-- Click to verify
-    
-    It depends on scheduling policy. If you prioritize prefill first, B’s prefill (10 tokens) may be scheduled immediately, then A’s prefill might be chunked. B will likely finish first because its short prompt allows it to enter decode quickly, and decode steps are cheap.
+<details>
+<summary>Click to verify</summary>
+
+It depends on scheduling policy. If you prioritize prefill first, B’s prefill (10 tokens) may be scheduled immediately, then A’s prefill might be chunked. B will likely finish first because its short prompt allows it to enter decode quickly, and decode steps are cheap.
     
 
 ### 4.10 Checkpoint
@@ -1094,9 +1111,10 @@ Modern inference systems employ several advanced techniques to further optimize 
 
 **Question:** Consider a chatbot where every conversation starts with the system prompt “You are a helpful assistant.” This prompt is 20 tokens long. If 500 users are chatting simultaneously, how much memory can prefix caching save if the KV cache per user is 1 GB? Assume the system prompt’s KV cache is 10 MB.
 
-- Click to calculate
-    
-    Without prefix caching: each user stores the full KV cache (1 GB) = 500 GB total.
+<details>
+<summary>Click to calculate</summary>
+
+Without prefix caching: each user stores the full KV cache (1 GB) = 500 GB total.
     
     With prefix caching: the system prompt’s KV cache (10 MB) is stored once and shared. Each user only stores their unique conversation after the prompt. If average conversation length is 1000 tokens, each user’s unique cache is 1 GB - 10 MB = 990 MB. Total = 10 MB + 500 × 990 MB ≈ 10 MB + 495 GB ≈ 495 GB. Saving = 5 GB. The saving grows with the number of users.
     
@@ -1461,6 +1479,8 @@ Your mental model of LLM serving now includes the critical trade‑offs that eng
     1. **Chunked prefill:** Splits long prompts into chunks interleaved with decode steps to prevent head-of-line blocking.
     2. **Prefix caching:** Reuses KV cache for common prefixes (e.g., system prompts) across requests to save memory.
     3. **Speculative decoding:** Uses a draft model to propose multiple tokens, verified in parallel by the target model, reducing latency.
+
+</details>
 
 ---
 
