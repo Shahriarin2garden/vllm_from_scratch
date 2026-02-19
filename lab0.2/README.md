@@ -114,16 +114,17 @@ $$
 where $K_{1:t-1}, V_{1:t-1}$ are the key and value vectors from all previous tokens. If we had to recompute these vectors for every new token, the cost would be $O(T^2)$. This is why we cache them – the **KV cache** [2].
 
 ```mermaid
-graph TD
-    subgraph Without Cache
-        A[Step 1] --> B[Compute K1,V1]
-        B --> C[Step 2] --> D[Compute K1,V1 again + K2,V2]
-        D --> E[Step 3] --> F[Compute K1,V1, K2,V2 again + K3,V3]
+graph TB
+    subgraph WithoutCache["Without Cache - O(T²) complexity"]
+        A1[Step 1] --> B1[Compute K1,V1]
+        A2[Step 2] --> B2[Compute K1,V1 + K2,V2]
+        A3[Step 3] --> B3[Compute K1,V1 + K2,V2 + K3,V3]
     end
-    subgraph With Cache
-        G[Step 1] --> H[Compute & Store K1,V1]
-        H --> I[Step 2] --> J[Read K1,V1, Compute & Store K2,V2]
-        J --> K[Step 3] --> L[Read K1,V1,K2,V2, Compute & Store K3,V3]
+    
+    subgraph WithCache["With Cache - O(T) complexity"]
+        C1[Step 1] --> D1[Compute & Store K1,V1]
+        C2[Step 2] --> D2[Read K1,V1<br/>Compute & Store K2,V2]
+        C3[Step 3] --> D3[Read K1,V1,K2,V2<br/>Compute & Store K3,V3]
     end
 ```
 
@@ -153,27 +154,12 @@ Each token produces a key and a value vector per layer. For each layer: $2 \time
 The following diagram from the ORCA paper illustrates the autoregressive inference process for a 3-layer GPT model [10]:
 
 ```mermaid
-graph TD
-    subgraph "Iteration 1 (Prefill)"
-        I1["Input: I think this"] --> L1_1[Layer 1]
-        L1_1 --> L2_1[Layer 2]
-        L2_1 --> L3_1[Layer 3]
-        L3_1 --> O1["Output: is"]
-    end
-    subgraph "Iteration 2 (Decode)"
-        I2["Input: I think this is"] --> L1_2[Layer 1]
-        L1_2 --> L2_2[Layer 2]
-        L2_2 --> L3_2[Layer 3]
-        L3_2 --> O2["Output: awesome"]
-    end
-    subgraph "Iteration 3 (Decode)"
-        I3["Input: I think this is awesome"] --> L1_3[Layer 1]
-        L1_3 --> L2_3[Layer 2]
-        L2_3 --> L3_3[Layer 3]
-        L3_3 --> O3["Output: <EOS>"]
-    end
-    O1 --> I2
-    O2 --> I3
+graph LR
+    I1["Iteration 1 Prefill:<br/>Input: I think this"] --> L1_1[Process Layer 1] --> L2_1[Process Layer 2] --> L3_1[Process Layer 3] --> O1["Output: is"]
+    O1 --> I2["Iteration 2 Decode:<br/>Input: I think this is"]
+    I2 --> L1_2[Process Layer 1] --> L2_2[Process Layer 2] --> L3_2[Process Layer 3] --> O2["Output: awesome"]
+    O2 --> I3["Iteration 3 Decode:<br/>Input: I think this is awesome"]
+    I3 --> L1_3[Process Layer 1] --> L2_3[Process Layer 2] --> L3_3[Process Layer 3] --> O3["Output: EOS"]
 ```
 
 **Diagram Explanation:** This diagram shows a 3-layer GPT model processing a request through multiple iterations. The first iteration (prefill) processes all input tokens ("I think this") in parallel and generates the first output token ("is"). Subsequent iterations (decode) process one token at a time, using previously generated tokens as input. Nodes with the same color represent the same model layer executing at different time steps. This visualization makes clear why inference must be sequential—each iteration depends on the output of the previous one.
@@ -184,20 +170,8 @@ The following diagram illustrates how the KV cache evolves during the decode pha
 
 ```mermaid
 graph LR
-    subgraph Step1["Step 1: After Prefill"]
-        B0_1["Block 0: tokens 0-3"]
-        B1_1["Block 1: tokens 4-6 + empty"] 
-    end
-    subgraph Step2["Step 2: First Decode"]
-        B0_2["Block 0: tokens 0-3"]
-        B1_2["Block 1: tokens 4-7"] 
-    end
-    subgraph Step3["Step 3: Second Decode"]
-        B0_3["Block 0: tokens 0-3"]
-        B1_3["Block 1: tokens 4-7"]
-        B2_3["Block 2: token 8"] 
-    end    
-    Step1 --> Step2 --> Step3
+    A1["Step 1: After Prefill<br/>Block 0: tokens 0-3<br/>Block 1: tokens 4-6"] --> A2["Step 2: First Decode<br/>Block 0: tokens 0-3<br/>Block 1: tokens 4-7"]
+    A2 --> A3["Step 3: Second Decode<br/>Block 0: tokens 0-3<br/>Block 1: tokens 4-7<br/>Block 2: token 8"]
 ```
 
 **Diagram Explanation:** This diagram shows the progressive growth of the KV cache during decode. After prefill with 7 tokens, logical blocks 0 and 1 are partially filled. The first decode step adds one token, filling the remaining slot in block 1. The second decode step requires allocating block 2. This incremental allocation avoids pre-allocating memory for the maximum possible sequence length, saving significant memory when actual output lengths are shorter.
@@ -220,12 +194,11 @@ pie title "A100 GPU Memory Allocation for 13B Model Inference"
 The following diagram compares vLLM's memory usage against other systems:
 
 ```mermaid
-graph LR
-    subgraph "Memory Usage vs Batch Size"
-        FT["FasterTransformer: Linear growth, high waste"]
-        Orca["Orca: Reduced waste, some fragmentation"]
-        vLLM["vLLM: Near-optimal, minimal fragmentation"]
-    end
+graph TB
+    FT["FasterTransformer:<br/>Linear growth, high waste"]
+    Orca["Orca:<br/>Reduced waste, some fragmentation"]
+    vLLM["vLLM with PagedAttention:<br/>Near-optimal, minimal fragmentation"]
+    FT --> Orca --> vLLM
 ```
 
 **Diagram Explanation:** This comparison shows how different systems handle memory as batch size increases. FasterTransformer shows steep memory growth due to pre-allocation. Orca improves but suffers from fragmentation. vLLM with PagedAttention achieves near-linear scaling, enabling much larger batch sizes within the same memory budget.
@@ -236,23 +209,10 @@ The following diagram illustrates the fragmentation problem in traditional KV ca
 
 ```mermaid
 graph TD
-    subgraph "Memory Before"
-        M1["Request A: 2048 slots allocated, 10 used → 2038 wasted (internal)"]
-        M2["Request B: 512 slots allocated, 5 used → 507 wasted (internal)"]
-        M3["Free: 1024 slots (fragmented into small pieces)"]
-    end
-    subgraph "New Request C needs 1024 contiguous slots"
-        M4["Cannot allocate despite 1024 total free (external fragmentation)"]
-    end
-    subgraph "Result"
-        Frag1["Internal fragmentation: 2545 slots wasted"]
-        Frag2["External fragmentation: Cannot use 1024 free slots"]
-        Frag3["Underutilization: ~60% of allocated memory unused"]
-    end
-    M1 & M2 & M3 --> M4
-    M2 & M4 --> Frag1
-    M3 & M4 --> Frag2
-    M2 & M4 --> Frag3
+    M1["Memory Before:<br/>Request A: 2048 slots allocated, 10 used"] --> Frag1[Internal fragmentation:<br/>2038 slots wasted in A]
+    M2["Request B: 512 slots allocated, 5 used"] --> Frag2[Internal fragmentation:<br/>507 slots wasted in B]
+    M3["Free: 1024 slots<br/>fragmented into small pieces"] --> Frag3[External fragmentation:<br/>Cannot allocate 1024 contiguous]
+    Frag1 & Frag2 & Frag3 --> Result["Result:<br/>Cannot serve new requests<br/>despite sufficient total memory"]
 ```
 
 **Diagram Explanation:** This diagram shows the fragmentation problem in traditional contiguous KV cache allocation. Request A pre-allocates 2048 slots but only uses 10, wasting 2038 slots internally. Request B pre-allocates 512 slots but only uses 5, wasting 507 slots. Even though total free memory (1024 slots) exceeds what Request C needs, external fragmentation prevents allocating a contiguous 1024-slot block. This motivates PagedAttention's block-based approach.
@@ -380,25 +340,15 @@ The following diagram illustrates the architecture of FlashInfer's prefill kerne
 
 ```mermaid
 graph TD
-    subgraph "Thread Block Organization"
-        TB["Thread Block"]
-        TB --> Warp1["Warp 1: Process query rows 0-15"]
-        TB --> Warp2["Warp 2: Process query rows 16-31"]
-        TB --> WarpN["Warp N: Process query rows ..."]
-    end
-    subgraph "Kernel Stages"
-        S1["Stage 1: Load Q tile to SRAM"]
-        S2["Stage 2: Async load K,V tile"]
-        S3["Stage 3: Compute QK transpose (mma_sync)"]
-        S4["Stage 4: Causal mask + softmax"]
-        S5["Stage 5: Compute output with V"]
-        S6["Stage 6: Update attention state"]
-        S1 --> S2 --> S3 --> S4 --> S5 --> S6
-    end
-    subgraph "Memory Tiling"
-        Qtile["Q Tile: CTA_TILE_Q rows"]
-        KVTILE["KV Tile: CTA_TILE_KV cols"]
-    end
+    TB[Thread Block] --> Warp1["Warp 1: Process query rows 0-15"]
+    TB --> Warp2["Warp 2: Process query rows 16-31"]
+    TB --> WarpN["Warp N: Process query rows ..."]
+    
+    S1["Stage 1: Load Q tile to SRAM"] --> S2["Stage 2: Async load K,V tile"]
+    S2 --> S3["Stage 3: Compute QK transpose"]
+    S3 --> S4["Stage 4: Causal mask + softmax"]
+    S4 --> S5["Stage 5: Compute output with V"]
+    S5 --> S6["Stage 6: Update attention state"]
 ```
 
 **Diagram Explanation:** This diagram shows the thread block organization in FlashInfer's prefill kernel. Each thread block processes a tile of query rows (`CTA_TILE_Q`) and a tile of KV columns (`CTA_TILE_KV`). Warps within the block distribute the query rows. The kernel operates in six stages: loading query data to shared memory, asynchronously loading key/value tiles, computing QK multiplication using tensor core `mma_sync` instructions, applying causal masking and softmax, computing the output with value tensors, and updating the attention state with online softmax statistics.
@@ -421,21 +371,12 @@ Modern GPUs have a complex memory hierarchy. Understanding it is key to optimizi
 
 ```mermaid
 flowchart TD
-    subgraph HBM[High Bandwidth Memory ~40-80GB<br/>Bandwidth: 1-2 TB/s]
-        W[Model Weights]
-        IO[Activations]
-    end
-    subgraph L2[L2 Cache ~40MB<br/>Bandwidth: 4-8 TB/s]
-        TC[Tiling Cache]
-    end
-    subgraph L1[L1/SRAM ~10-20MB per SM<br/>Bandwidth: 10-20 TB/s]
-        Reg[Register File]
-    end
-    subgraph SM[Streaming Multiprocessor]
-        TCU[Tensor Cores<br/>Compute: 312 TFLOPS FP16]
-        FPU[FP32 Units]
-    end
-    HBM --> L2 --> L1 --> SM
+    W[Model Weights] --> L2
+    IO[Activations] --> L2
+    L2["L2 Cache ~40MB<br/>Bandwidth: 4-8 TB/s"] --> L1
+    L1["L1/SRAM ~10-20MB per SM<br/>Bandwidth: 10-20 TB/s"] --> Reg[Register File]
+    Reg --> TCU["Tensor Cores<br/>Compute: 312 TFLOPS FP16"]
+    Reg --> FPU[FP32 Units]
 ```
 
 **Arithmetic intensity** = total FLOPs / total bytes moved. For prefill, it is proportional to $S$, so for typical prompts ($S > 100$) it exceeds the GPU’s ops:byte ratio, making it compute‑bound.
@@ -467,24 +408,20 @@ graph TD
 FlashAttention, introduced by Dao et al. (2022) [3], is an IO-aware exact attention algorithm that uses tiling to reduce memory reads/writes. It achieves 2-4× speedup compared to PyTorch standard attention.
 
 ```mermaid
-graph TD
-    subgraph StandardAttention[Standard Attention]
-        A1[Load Q,K,V from HBM] --> A2[Compute S]
-        A2 --> A3[Write S to HBM]
-        A3 --> A4[Load S from HBM]
-        A4 --> A5[Compute softmax]
-        A5 --> A6[Write P to HBM]
-        A6 --> A7[Load P from HBM]
-        A7 --> A8[Compute output]
-        A8 --> A9[Write O to HBM]
-    end
-
-    subgraph FlashAttention[FlashAttention]
-        B1[Load Q tile to SRAM] --> B2[Load K tile to SRAM]
-        B2 --> B3[Compute on tile]
-        B3 --> B4[Load V tile]
-        B4 --> B5[Write final O to HBM]
-    end
+graph LR
+    SA1["Standard Attention:<br/>Load Q,K,V from HBM"] --> SA2[Compute S]
+    SA2 --> SA3[Write S to HBM]
+    SA3 --> SA4[Load S from HBM]
+    SA4 --> SA5[Compute softmax]
+    SA5 --> SA6[Write P to HBM]
+    SA6 --> SA7[Load P from HBM]
+    SA7 --> SA8[Compute output]
+    SA8 --> SA9[Write O to HBM]
+    
+    FA1["FlashAttention:<br/>Load Q tile to SRAM"] --> FA2[Load K tile to SRAM]
+    FA2 --> FA3[Compute on tile]
+    FA3 --> FA4[Load V tile]
+    FA4 --> FA5[Write final O to HBM]
 ```
 
 **Memory savings:** FlashAttention reduces memory footprint from quadratic to linear in sequence length. At sequence length 4K, memory savings reach 20× [3].
@@ -554,22 +491,18 @@ output = flash_attn(q, k, v)
 The official FlashAttention benchmarks show significant improvements across different GPUs [4]:
 
 ```mermaid
-graph LR
-    subgraph A100[A100 Speedup]
-        direction TB
-        S1[Seq Len 512: 2.5×]
-        S2[Seq Len 1K: 3×]
-        S3[Seq Len 2K: 3.5×]
-        S4[Seq Len 4K: 4×]
-    end
-
-    subgraph T4[T4 Speedup]
-        direction TB
-        T1[Seq Len 512: 3×]
-        T2[Seq Len 1K: 3.5×]
-        T3[Seq Len 2K: 4×]
-        T4[Seq Len 4K: 4.5×]
-    end
+graph TB
+    A100["A100 GPU Speedup"]
+    A100 --> S1["Seq Len 512: 2.5x"]
+    A100 --> S2["Seq Len 1K: 3x"]
+    A100 --> S3["Seq Len 2K: 3.5x"]
+    A100 --> S4["Seq Len 4K: 4x"]
+    
+    T4GPU["T4 GPU Speedup"]
+    T4GPU --> T1["Seq Len 512: 3x"]
+    T4GPU --> T2["Seq Len 1K: 3.5x"]
+    T4GPU --> T3["Seq Len 2K: 4x"]
+    T4GPU --> T4["Seq Len 4K: 4.5x"]
 ```
 
 ### 2.12 Multi-Query and Grouped-Query Attention
@@ -577,19 +510,18 @@ graph LR
 Modern models often use **Multi-Query Attention (MQA)** or **Grouped-Query Attention (GQA)** to reduce KV cache size and memory bandwidth. Instead of having separate key/value heads for each query head, they share keys and values across groups of query heads [5].
 
 ```mermaid
-graph TD
-    subgraph MHA[Multi-Head Attention]
-        Q1[Query head 1] --> K1[Key head 1] & V1[Value head 1]
-        Q2[Query head 2] --> K2[Key head 2] & V2[Value head 2]
-    end
-    subgraph GQA[Grouped-Query Attention]
-        GQ1[Query head 1] --> K1[Key head 1] & V1[Value head 1]
-        GQ2[Query head 2] --> K1 & V1
-    end
-    subgraph MQA[Multi-Query Attention]
-        MQ1[Query head 1] --> K[Single Key head] & V[Single Value head]
-        MQ2[Query head 2] --> K & V
-    end
+graph TB
+    MHA["Multi-Head Attention<br/>Each query head has own K,V"]
+    MHA --> MHA1["Q1 → K1, V1"]
+    MHA --> MHA2["Q2 → K2, V2"]
+    
+    GQA["Grouped-Query Attention<br/>Query heads share K,V in groups"]
+    GQA --> GQA1["Q1 → K1, V1"]
+    GQA --> GQA2["Q2 → K1, V1"]
+    
+    MQA["Multi-Query Attention<br/>All query heads share one K,V"]
+    MQA --> MQA1["Q1 → K, V"]
+    MQA --> MQA2["Q2 → K, V"]
 ```
 
 **Memory savings:** For Llama 2 70B (8 KV heads, 64 query heads), GQA reduces KV cache size by 8× compared to MHA.
@@ -674,16 +606,11 @@ The following diagram from FlashInfer documentation illustrates the decode phase
 
 ```mermaid
 graph TD
-    subgraph "Decode Phase: Single Query Token"
-        Q["Query: num_heads x head_dim<br/>Single new token"]
-        K["Key Cache: kv_len x num_heads x head_dim<br/>All previous tokens"]
-        V["Value Cache: kv_len x num_heads x head_dim<br/>All previous tokens"]
-        Q --> Attn["Attention Computation"]
-        K --> Attn
-        V --> Attn
-        Attn --> Out["Output: num_heads x head_dim<br/>Single prediction vector"]
-        Out --> Append["Append to KV Cache"]
-    end
+    Q["Decode Phase: Single Query Token<br/>Query: num_heads x head_dim"] --> Attn[Attention Computation]
+    K["Key Cache: kv_len x num_heads x head_dim<br/>All previous tokens"] --> Attn
+    V["Value Cache: kv_len x num_heads x head_dim<br/>All previous tokens"] --> Attn
+    Attn --> Out["Output: num_heads x head_dim<br/>Single prediction vector"]
+    Out --> Append[Append to KV Cache]
 ```
 
 **Diagram Explanation:** This diagram shows the data flow during the decode phase. Unlike prefill, the query is a single token with shape `[num_heads, head_dim]`. The key and value tensors are the accumulated KV cache from all previous tokens. Attention is computed between this single query and all cached keys/values. The output is a single vector used to predict the next token. This phase is memory-bound because it must read the entire KV cache for each token generated.
@@ -694,17 +621,14 @@ The following diagram illustrates FlashInfer's decode kernel architecture with p
 
 ```mermaid
 graph TD
-    subgraph "Decode Kernel Pipeline"
-        Q["Load Query (single token)<br/>once into registers"]
-        Q --> Loop["Iterate through KV tiles"]
-        Loop --> Load["Load KV tile from HBM"]
-        Load --> Compute["Compute QK dot products<br/>for all tokens in tile"]
-        Compute --> Update["Update running softmax<br/>max, sum, partial output"]
-        Update --> Check{"More tiles?"}
-        Check -->|Yes| Loop
-        Check -->|No| Final["Finalize softmax normalization"]
-        Final --> Write["Write output"]
-    end
+    Q["Load Query (single token)<br/>once into registers"] --> Loop[Iterate through KV tiles]
+    Loop --> Load[Load KV tile from HBM]
+    Load --> Compute["Compute QK dot products<br/>for all tokens in tile"]
+    Compute --> Update["Update running softmax<br/>max, sum, partial output"]
+    Update --> Check{More tiles?}
+    Check -->|Yes| Loop
+    Check -->|No| Final[Finalize softmax normalization]
+    Final --> Write[Write output]
 ```
 
 **Diagram Explanation:** This diagram shows the pipelined architecture of FlashInfer's decode kernel. The query vector is loaded once into registers. Then the kernel iterates through KV cache tiles, loading each tile from HBM, computing QK dot products for all tokens in the tile, and updating the online softmax state. This pipelining overlaps computation with memory loads, hiding some latency, but the kernel remains memory-bound because the ratio of computation to memory access is low.
@@ -715,28 +639,15 @@ The following diagram breaks down memory access and compute per decode step:
 
 ```mermaid
 graph TD
-    subgraph "Memory Access per Decode Step"
-        Weights["Model Weights: 14 GB<br/>(loaded once per batch)"]
-        KVRead["KV Cache Read: 512 MB × t<br/>(grows with sequence length t)"]
-        KVWrite["New KV Write: 512 MB<br/>(one token)"]
-    end
-    subgraph "Compute per Decode Step"
-        FLOPS["Total FLOPs: ~14 GFLOPS<br/>(one forward pass)"]
-    end
-    subgraph "Arithmetic Intensity"
-        AI_calc["AI: 14 GFLOPS / 14.5 GB"]
-        AI_val["AI ≈ 0.97 FLOPs/byte"]
-    end
-    subgraph "Comparison"
-        Threshold["Threshold for compute-bound: ~100 FLOPs/byte"]
-        Conclusion["Decode is MEMORY-BOUND"]
-    end
-    Weights & KVRead & KVWrite --> AI_calc
-    FLOPS --> AI_calc
-    AI_calc --> AI_val
-    AI_val --> Compare["Compare"]
-    Threshold --> Compare
-    Compare --> Conclusion
+    Weights["Model Weights: 14 GB<br/>(loaded once per batch)"] --> AI_calc
+    KVRead["KV Cache Read: 512 MB x t<br/>(grows with sequence length)"] --> AI_calc
+    KVWrite["New KV Write: 512 MB<br/>(one token)"] --> AI_calc
+    FLOPS["Total FLOPs: ~14 GFLOPS<br/>(one forward pass)"] --> AI_calc
+    
+    AI_calc["Arithmetic Intensity:<br/>14 GFLOPS / 14.5 GB"] --> AI_val["AI ≈ 0.97 FLOPs/byte"]
+    AI_val --> Compare[Compare to threshold]
+    Threshold["Threshold for compute-bound:<br/>~100 FLOPs/byte"] --> Compare
+    Compare --> Conclusion["Decode is MEMORY-BOUND"]
 ```
 
 **Diagram Explanation:** This diagram quantifies why decode is memory-bound. The left column shows bytes moved from HBM: model weights (loaded once per batch), KV cache read (grows with sequence length t), and new KV write. The middle column shows FLOPs performed. The resulting arithmetic intensity (FLOPs/byte) is typically 0.1-1, far below the 100+ needed to keep tensor cores busy. The GPU spends most time waiting for data movement.
@@ -749,15 +660,8 @@ The cache grows linearly with each step, increasing the memory footprint and the
 
 ```mermaid
 graph LR
-    subgraph Step1
-        K1[K cache: 1 token] --> V1[V cache: 1 token]
-    end
-    subgraph Step2
-        K2[K cache: 2 tokens] --> V2[V cache: 2 tokens]
-    end
-    subgraph Step3
-        K3[K cache: 3 tokens] --> V3[V cache: 3 tokens]
-    end
+    K1["Step 1:<br/>K cache: 1 token<br/>V cache: 1 token"] --> K2["Step 2:<br/>K cache: 2 tokens<br/>V cache: 2 tokens"]
+    K2 --> K3["Step 3:<br/>K cache: 3 tokens<br/>V cache: 3 tokens"]
 ```
 
 ### 3.5 The Memory Fragmentation Problem
@@ -766,18 +670,9 @@ Traditional systems allocate contiguous memory for each sequence’s KV cache. T
 
 ```mermaid
 graph TD
-    subgraph Step1[Step 1: User 1 reserves 40GB slot]
-        M1[Memory: 0-40GB allocated for User 1]
-    end
-
-    subgraph Step2[Step 2: User 1 finishes, memory freed]
-        M2[Memory: Free but with 1GiB alignment boundaries]
-    end
-
-    subgraph Step3[Step 3: User 2 tries to allocate 40GB]
-        M3[Memory: No contiguous 40GB block available<br/>due to alignment metadata]
-        Result[Result: OOM error despite 80GB free]
-    end
+    Step1["User 1 reserves 40GB slot"] --> Step2["User 1 finishes, memory freed<br/>but with alignment boundaries"]
+    Step2 --> Step3["User 2 tries to allocate 40GB"]
+    Step3 --> Result["Result: OOM error<br/>despite 80GB free<br/>due to fragmentation"]
 ```
 
 This fragmentation limits concurrent users and wastes GPU memory [7].
@@ -788,15 +683,11 @@ This fragmentation limits concurrent users and wastes GPU memory [7].
 
 ```mermaid
 flowchart LR
-    subgraph Logical[Logical sequence tokens]
-        T0[T0] --> T1[T1] --> T2[T2] --> T3[T3] --> T4[T4]
-    end
-    subgraph Physical[Physical memory blocks]
-        B0[Block 0] --> T0[T0] & T1[T1]
-        B1[Block 1] --> T2[T2] & T3[T3]
-        B2[Block 2] --> T4[T4]
-    end
-    Logical --> Mapping[Block Table] --> Physical
+    T0[T0] --> T1[T1] --> T2[T2] --> T3[T3] --> T4[T4]
+    T4 --> Mapping[Block Table]
+    Mapping --> B0["Block 0: T0, T1"]
+    Mapping --> B1["Block 1: T2, T3"]
+    Mapping --> B2["Block 2: T4"]
 ```
 
 This allows non‑contiguous allocation, eliminates fragmentation, and enables sharing of common prefixes (e.g., system prompts) [7].
@@ -807,21 +698,17 @@ The following diagram from vLLM documentation illustrates how threads access Pag
 
 ```mermaid
 graph TD
-    subgraph "Thread Group Memory Access"
-        TG["Thread Group (2 threads)"]
-        TG --> T0["Thread 0: handles even elements"]
-        TG --> T1["Thread 1: handles odd elements"]
-        
-        subgraph "Memory Layout"
-            QToken["Query Token"]
-            KToken["Key Token Block"]
-        end
-        
-        T0 --> K0["K even indices"]
-        T1 --> K1["K odd indices"]
-        
-        Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
-    end
+    TG["Thread Group (2 threads)"] --> T0["Thread 0: handles even elements"]
+    TG --> T1["Thread 1: handles odd elements"]
+    
+    QToken[Query Token] --> TG
+    KToken[Key Token Block] --> T0
+    KToken --> T1
+    
+    T0 --> K0["K even indices"]
+    T1 --> K1["K odd indices"]
+    
+    K0 & K1 --> Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
 ```
 
 **Diagram Explanation:** This diagram shows how thread groups access memory in the PagedAttention kernel. Each thread group (2 threads in this example) handles one query token and one key token. Each thread processes a subset of elements (every other element) so that neighboring threads read neighboring memory addresses, achieving memory coalescing for better bandwidth utilization.
@@ -885,12 +772,10 @@ Speculative decoding [9] uses a smaller draft model to propose multiple tokens, 
 
 ```mermaid
 graph LR
-    subgraph Speculative[Speculative Decoding]
-        A[Input token] --> B[Draft model generates K candidates]
-        B --> C[Target model verifies all in parallel]
-        C --> D[Accept longest prefix]
-        D --> E[Next input token]
-    end
+    A[Input token] --> B["Draft model<br/>generates K candidates"]
+    B --> C["Target model<br/>verifies all in parallel"]
+    C --> D[Accept longest prefix]
+    D --> E[Next input token]
 ```
 
 **Implementation note:** This technique is especially effective when the draft model is much smaller and the acceptance rate is high.
@@ -944,19 +829,8 @@ A production server handles many requests simultaneously. Some are in prefill (p
 
 ```mermaid
 flowchart LR
-    subgraph Static[Static Batching]
-        Fill[Fill batch, then run]
-        Wait[Wait for timeout or full]
-    end
-    subgraph Dynamic[Dynamic Batching]
-        OR[Or‑recursive batching]
-        Adaptive[Adaptive batch size]
-    end
-    subgraph Continuous[Continuous Batching]
-        Iter[Iteration‑level scheduling]
-        Chunk[Chunk‑aware prefill]
-    end
-    Static --> Dynamic --> Continuous
+    Static["Static Batching:<br/>Fill batch, then run<br/>Wait for timeout or full"] --> Dynamic["Dynamic Batching:<br/>Or-recursive batching<br/>Adaptive batch size"]
+    Dynamic --> Continuous["Continuous Batching:<br/>Iteration-level scheduling<br/>Chunk-aware prefill"]
 ```
 
 **Continuous batching** (used in vLLM, TGI) adds new requests to the batch at every iteration, allowing prefill chunks to interleave with decode steps [10].
@@ -966,17 +840,11 @@ flowchart LR
 Studies show significant improvements with continuous batching [7,10]:
 
 ```mermaid
-graph LR
-    subgraph Throughput[Throughput Improvement]
-        T1[Traditional: baseline]
-        T2[vLLM: +30%]
-        T3[TGI: +40%]
-    end
-
-    subgraph Utilization[GPU Utilization]
-        U1[Traditional: 60-70%]
-        U2[Continuous: 90-95%]
-    end
+graph TB
+    Traditional["Traditional Batching:<br/>Baseline throughput<br/>GPU Utilization: 60-70%"]
+    vLLM["vLLM:<br/>+30% throughput<br/>GPU Utilization: 90-95%"]
+    TGI["TGI:<br/>+40% throughput<br/>GPU Utilization: 90-95%"]
+    Traditional --> vLLM --> TGI
 ```
 
 ### 4.5 Continuous Batching State Machine
@@ -1000,20 +868,12 @@ The scheduler may pause a low‑priority decode request and swap its KV cache to
 Long prompts create imbalance [11]:
 
 ```mermaid
-graph TD
-    subgraph WithoutChunking[Without Chunked Prefill]
-        T0[Time 0ms] --> P[32K token prefill: 2-8 seconds]
-        P --> D1[Decode user 1: token 1]
-        D1 --> D2[Decode user 1: token 2]
-        Note[200 decode users starved during prefill]
-    end
-
-    subgraph WithChunking[With Chunked Prefill]
-        C1[Prefill chunk 1: 512 tokens] --> D1[Decode all users: 1 step]
-        D1 --> C2[Prefill chunk 2: 512 tokens]
-        C2 --> D2[Decode all users: 1 step]
-        Note2[Decode users get tokens every iteration]
-    end
+graph LR
+    WO1["Without Chunking:<br/>Time 0ms"] --> WO2["32K token prefill<br/>2-8 seconds<br/>200 decode users starved"]
+    WO2 --> WO3["Decode user 1: token 1"] --> WO4["Decode user 1: token 2"]
+    
+    WC1["With Chunking:<br/>Prefill chunk 1<br/>512 tokens"] --> WC2["Decode all users:<br/>1 step"]
+    WC2 --> WC3["Prefill chunk 2<br/>512 tokens"] --> WC4["Decode all users:<br/>1 step"]
 ```
 
 ### 4.7 Implementation: Simple Continuous Batching Simulator
@@ -1131,12 +991,11 @@ Long prompts can block decode requests for hundreds of milliseconds. **Chunked p
 
 ```mermaid
 flowchart LR
-    subgraph Without Chunking
-        A[Long prefill: 500ms] --> B[Decode step 1] --> C[Decode step 2]
-    end
-    subgraph With Chunking
-        D[Prefill chunk 1: 50ms] --> E[Decode step 1] --> F[Prefill chunk 2: 50ms] --> G[Decode step 2] --> H[Prefill chunk 3: 50ms]
-    end
+    WO1["Without Chunking:<br/>Long prefill 500ms"] --> WO2[Decode step 1] --> WO3[Decode step 2]
+    
+    WC1["With Chunking:<br/>Prefill chunk 1: 50ms"] --> WC2[Decode step 1]
+    WC2 --> WC3["Prefill chunk 2: 50ms"] --> WC4[Decode step 2]
+    WC4 --> WC5["Prefill chunk 3: 50ms"]
 ```
 
 Benefits of chunked prefill [11]:
@@ -1161,18 +1020,16 @@ Sliding window attention limits each token’s attention span to a fixed-size wi
 
 ```mermaid
 graph TD
-    subgraph SlidingWindow[Sliding Window Attention - Window Size 3]
-        W1[T5 attends to T2,T3,T4]
-        W2[T6 attends to T3,T4,T5]
-        W3[T7 attends to T4,T5,T6]
-    end
-
-    subgraph CyclicKV[Cyclic KV Cache]
-        B0[Block 0: tokens 1-64]
-        B1[Block 1: tokens 65-128]
-        B2[Block 2: tokens 129-192]
-        New[New token 193 overwrites block 0]
-    end
+    SW1["Sliding Window Attention<br/>Window Size 3"]
+    SW1 --> W1["T5 attends to T2,T3,T4"]
+    SW1 --> W2["T6 attends to T3,T4,T5"]
+    SW1 --> W3["T7 attends to T4,T5,T6"]
+    
+    CK1["Cyclic KV Cache"]
+    CK1 --> B0["Block 0: tokens 1-64"]
+    CK1 --> B1["Block 1: tokens 65-128"]
+    CK1 --> B2["Block 2: tokens 129-192"]
+    B2 --> New["New token 193<br/>overwrites block 0"]
 ```
 
 TensorRT-LLM implements this as a circular buffer [13]:
@@ -1190,20 +1047,10 @@ Many requests share common prefixes (system prompts, chat templates). Prefix cac
 
 ```mermaid
 graph TD
-    subgraph SharedPrefix[Shared System Prompt]
-        P1[Token 1: 'You are a helpful assistant']
-        P2[Token 2: 'Answer the following question']
-    end
-
-    subgraph Divergent[Divergent User Messages]
-        U1[User 1: 'What is Python?']
-        U2[User 2: 'Explain quantum computing']
-    end
-
-    P1 --> P2
-    P2 --> U1
-    P2 --> U2
-    Note[KV cache for P1,P2 computed once, shared]
+    P1["Shared Prefix:<br/>You are a helpful assistant"] --> P2["Answer the following question"]
+    P2 --> U1["User 1:<br/>What is Python?"]
+    P2 --> U2["User 2:<br/>Explain quantum computing"]
+    Note["KV cache for P1,P2<br/>computed once, shared"] --> P1
 ```
 
 **Memory savings example** [7]:
@@ -1232,12 +1079,10 @@ For extremely long contexts (100K+ tokens), even PagedAttention may not suffice.
 
 ```mermaid
 graph TD
-    subgraph EvictionStrategies[KV Cache Optimization]
-        S1[KIVI: 2-4 bit quantization]
-        S2[StreamingLLM: keep sink + recent tokens]
-        S3[Ada-KV: adaptive budget allocation]
-        S4[DuoAttention: full cache for retrieval heads]
-    end
+    S1["KIVI:<br/>2-4 bit quantization<br/>reduces memory usage"]
+    S2["StreamingLLM:<br/>keep sink + recent tokens<br/>enables infinite sequences"]
+    S3["Ada-KV:<br/>adaptive budget allocation<br/>reduces eviction loss"]
+    S4["DuoAttention:<br/>full cache for retrieval heads<br/>optimizes long contexts"]
 ```
 
 **Ada-KV** (Feng et al., 2024) adaptively allocates KV cache budgets across attention heads, reducing eviction loss [18].
@@ -1248,11 +1093,11 @@ Because prefill and decode have different hardware requirements, some systems se
 
 ```mermaid
 flowchart LR
-    Client --> Gateway
-    Gateway --> PrefillCluster[Prefill Nodes<br/>Compute‑optimized<br/>H100]
-    PrefillCluster --> CacheStore[KV Cache Store<br/>High‑speed fabric<br/>InfiniBand/NVLink]
-    CacheStore --> DecodeCluster[Decode Nodes<br/>Memory‑optimized<br/>A100 with large HBM]
-    DecodeCluster --> Client
+    Client[Client Requests] --> Gateway[Gateway Router]
+    Gateway --> Prefill["Prefill Nodes<br/>Compute-optimized H100"]
+    Prefill --> Cache["KV Cache Store<br/>High-speed fabric<br/>InfiniBand/NVLink"]
+    Cache --> Decode["Decode Nodes<br/>Memory-optimized A100<br/>with large HBM"]
+    Decode --> Client
 ```
 
 TensorRT-LLM added disaggregation support with pipeline parallelism in 2025 [13].
@@ -1285,16 +1130,12 @@ Based on the comprehensive guide from Hugging Face [21] and production experienc
 
 ```mermaid
 graph TD
-    subgraph Levers[Optimization Levers]
-        L1["1. Continuous batching + paged KV"]
-        L2["2. Weight quantization 4-bit"]
-        L3["3. Chunked prefill"]
-        L4["4. FlashAttention"]
-        L5["5. Prefix caching"]
-        L6["6. Speculative decoding"]
-        L7["7. CUDA Graphs + kernel fusion"]
-    end
-    L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+    L1["1. Continuous batching<br/>+ paged KV"] --> L2["2. Weight quantization<br/>4-bit"]
+    L2 --> L3["3. Chunked prefill"]
+    L3 --> L4["4. FlashAttention"]
+    L4 --> L5["5. Prefix caching"]
+    L5 --> L6["6. Speculative decoding"]
+    L6 --> L7["7. CUDA Graphs<br/>+ kernel fusion"]
 ```
 
 ### 6.2 Production-Ready Configuration Examples
@@ -1343,15 +1184,15 @@ When optimizing your inference stack, follow this decision tree:
 
 ```mermaid
 graph TD
-    Start[Start] --> Q1{"Latency SLO strict?"}
-    Q1 -->|Yes| Use["Use small batch, prioritize decode"]
-    Q1 -->|No| Q2{"Throughput critical?"}
-    Q2 -->|Yes| UseCont["Use continuous batching, large batch"]
-    Q2 -->|No| Q3{"Memory constrained?"}
-    Q3 -->|Yes| UseQuant["Quantize weights, use PagedAttention"]
-    Q3 -->|No| Q4{"Long prompts common?"}
-    Q4 -->|Yes| UseChunk["Enable chunked prefill"]
-    Q4 -->|No| UseFlash["Use FlashAttention"]
+    Start[Start Optimization] --> Q1{"Latency SLO<br/>strict?"}
+    Q1 -->|Yes| Use["Use small batch<br/>prioritize decode"]
+    Q1 -->|No| Q2{"Throughput<br/>critical?"}
+    Q2 -->|Yes| UseCont["Use continuous batching<br/>large batch"]
+    Q2 -->|No| Q3{"Memory<br/>constrained?"}
+    Q3 -->|Yes| UseQuant["Quantize weights<br/>use PagedAttention"]
+    Q3 -->|No| Q4{"Long prompts<br/>common?"}
+    Q4 -->|Yes| UseChunk["Enable<br/>chunked prefill"]
+    Q4 -->|No| UseFlash["Use<br/>FlashAttention"]
 ```
 
 ### 6.5 Performance Tuning Checklist
