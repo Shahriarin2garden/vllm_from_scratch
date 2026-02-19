@@ -1,6 +1,8 @@
+
+
 # Lab 0.2: Prefill vs. Decode – The Two-Phase Engine
 
-**Navigation:** [← Lab 0.1](lab0.1/README.md) | [Lab 0.2 README](lab0.2/README.md) | [Next: Lab 0.3 →](lab0.3/README.md)
+**Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
 
 ---
 
@@ -1493,4 +1495,4 @@ Your mental model of LLM serving now includes the critical trade‑offs that eng
 
 ---
 
-**Navigation:** [← Lab 0.1](lab0.1/README.md) | [Lab 0.2 README](lab0.2/README.md) | [Next: Lab 0.3 →](lab0.3/README.md)
+**Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
