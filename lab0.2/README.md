@@ -185,17 +185,17 @@ The following diagram illustrates how the KV cache evolves during the decode pha
 ```mermaid
 graph LR
     subgraph Step1["Step 1: After Prefill"]
-        B0_1["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_1["Block 1: [K4,V4][K5,V5][K6,V6][____]"] 
+        B0_1["Block 0: tokens 0-3"]
+        B1_1["Block 1: tokens 4-6 + empty"] 
     end
     subgraph Step2["Step 2: First Decode"]
-        B0_2["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_2["Block 1: [K4,V4][K5,V5][K6,V6][K7,V7]"] 
+        B0_2["Block 0: tokens 0-3"]
+        B1_2["Block 1: tokens 4-7"] 
     end
     subgraph Step3["Step 3: Second Decode"]
-        B0_3["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_3["Block 1: [K4,V4][K5,V5][K6,V6][K7,V7]"]
-        B2_3["Block 2: [K8,V8][____][____][____]"] 
+        B0_3["Block 0: tokens 0-3"]
+        B1_3["Block 1: tokens 4-7"]
+        B2_3["Block 2: token 8"] 
     end    
     Step1 --> Step2 --> Step3
 ```
@@ -333,14 +333,14 @@ The following diagram from FlashInfer documentation illustrates the prefill phas
 ```mermaid
 graph TD
     subgraph "Prefill Phase: Multiple Query Tokens"
-        Q["Query: [qo_len, num_heads, head_dim]"]
-        K["Key: [kv_len, num_heads, head_dim]"]
-        V["Value: [kv_len, num_heads, head_dim]"]
+        Q["Query: qo_len x num_heads x head_dim"]
+        K["Key: kv_len x num_heads x head_dim"]
+        V["Value: kv_len x num_heads x head_dim"]
         Q --> Attn["Attention Computation"]
         K --> Attn
         V --> Attn
         Attn --> Mask["Causal Masking"]
-        Mask --> Out["Output: [qo_len, num_heads, head_dim]"]
+        Mask --> Out["Output: qo_len x num_heads x head_dim"]
         Out --> KVCache["Populate KV Cache"]
     end
 ```
@@ -363,7 +363,7 @@ For a prompt of length $S$:
 ```mermaid
 graph TD
     subgraph AttentionComputation
-        A[Q: S×d] --> M1[MatMul Q×K^T]
+        A[Q: S×d] --> M1[MatMul Q×K transpose]
         B[K: S×d] --> M1
         M1 --> S[Scores: S×S]
         S --> SM[Softmax]
@@ -389,7 +389,7 @@ graph TD
     subgraph "Kernel Stages"
         S1["Stage 1: Load Q tile to SRAM"]
         S2["Stage 2: Async load K,V tile"]
-        S3["Stage 3: Compute QK^T (mma_sync)"]
+        S3["Stage 3: Compute QK transpose (mma_sync)"]
         S4["Stage 4: Causal mask + softmax"]
         S5["Stage 5: Compute output with V"]
         S6["Stage 6: Update attention state"]
@@ -450,7 +450,7 @@ graph TD
         QTile["Q Tile (Br × d)"]
         KTile["K Tile (Bc × d)"]
         VTile["V Tile (Bc × d)"]
-        QTile --> QK["Compute QK^T<br/>(Br × Bc)"]
+        QTile --> QK["Compute QK transpose<br/>(Br × Bc)"]
         KTile --> QK
         QK --> SM["Softmax Statistics<br/>(running max, sum)"]
         SM --> Attn["Attention Scores<br/>(Br × Bc)"]
@@ -469,20 +469,20 @@ FlashAttention, introduced by Dao et al. (2022) [3], is an IO-aware exact atten
 ```mermaid
 graph TD
     subgraph StandardAttention[Standard Attention]
-        A1[Load Q,K,V from HBM] --> A2[Compute S = QK^T]
+        A1[Load Q,K,V from HBM] --> A2[Compute S]
         A2 --> A3[Write S to HBM]
         A3 --> A4[Load S from HBM]
-        A4 --> A5[Compute P = softmax(S)]
+        A4 --> A5[Compute softmax]
         A5 --> A6[Write P to HBM]
         A6 --> A7[Load P from HBM]
-        A7 --> A8[Compute O = PV]
+        A7 --> A8[Compute output]
         A8 --> A9[Write O to HBM]
     end
 
     subgraph FlashAttention[FlashAttention]
         B1[Load Q tile to SRAM] --> B2[Load K tile to SRAM]
-        B2 --> B3[Compute on tile, update statistics]
-        B3 --> B4[Load V tile, compute partial output]
+        B2 --> B3[Compute on tile]
+        B3 --> B4[Load V tile]
         B4 --> B5[Write final O to HBM]
     end
 ```
@@ -675,13 +675,13 @@ The following diagram from FlashInfer documentation illustrates the decode phase
 ```mermaid
 graph TD
     subgraph "Decode Phase: Single Query Token"
-        Q["Query: [num_heads, head_dim]<br/>Single new token"]
-        K["Key Cache: [kv_len, num_heads, head_dim]<br/>All previous tokens"]
-        V["Value Cache: [kv_len, num_heads, head_dim]<br/>All previous tokens"]
+        Q["Query: num_heads x head_dim<br/>Single new token"]
+        K["Key Cache: kv_len x num_heads x head_dim<br/>All previous tokens"]
+        V["Value Cache: kv_len x num_heads x head_dim<br/>All previous tokens"]
         Q --> Attn["Attention Computation"]
         K --> Attn
         V --> Attn
-        Attn --> Out["Output: [num_heads, head_dim]<br/>Single prediction vector"]
+        Attn --> Out["Output: num_heads x head_dim<br/>Single prediction vector"]
         Out --> Append["Append to KV Cache"]
     end
 ```
@@ -724,7 +724,7 @@ graph TD
         FLOPS["Total FLOPs: ~14 GFLOPS<br/>(one forward pass)"]
     end
     subgraph "Arithmetic Intensity"
-        AI_calc["AI = 14 GFLOPS / 14.5 GB"]
+        AI_calc["AI: 14 GFLOPS / 14.5 GB"]
         AI_val["AI ≈ 0.97 FLOPs/byte"]
     end
     subgraph "Comparison"
@@ -817,8 +817,8 @@ graph TD
             KToken["Key Token Block"]
         end
         
-        T0 --> K0["K[0], K[2], K[4], ..."]
-        T1 --> K1["K[1], K[3], K[5], ..."]
+        T0 --> K0["K even indices"]
+        T1 --> K1["K odd indices"]
         
         Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
     end
@@ -1161,7 +1161,7 @@ Sliding window attention limits each token’s attention span to a fixed-size wi
 
 ```mermaid
 graph TD
-    subgraph SlidingWindow[Sliding Window Attention, Window Size=3]
+    subgraph SlidingWindow[Sliding Window Attention - Window Size 3]
         W1[T5 attends to T2,T3,T4]
         W2[T6 attends to T3,T4,T5]
         W3[T7 attends to T4,T5,T6]
@@ -1233,10 +1233,10 @@ For extremely long contexts (100K+ tokens), even PagedAttention may not suffice.
 ```mermaid
 graph TD
     subgraph EvictionStrategies[KV Cache Optimization]
-        S1[KIVI: 2-4 bit quantization [16]]
-        S2[StreamingLLM: keep sink + recent tokens [17]]
-        S3[Ada-KV: adaptive budget allocation [18]]
-        S4[DuoAttention: full cache only for retrieval heads [19]]
+        S1[KIVI: 2-4 bit quantization]
+        S2[StreamingLLM: keep sink + recent tokens]
+        S3[Ada-KV: adaptive budget allocation]
+        S4[DuoAttention: full cache for retrieval heads]
     end
 ```
 

@@ -390,13 +390,13 @@ The following diagram compares memory access patterns between standard attention
 graph TD
     subgraph "Standard Attention"
         A1[Load Q,K,V from HBM]
-        A2[Compute S = QK^T]
+        A2[Compute S]
         A3[Write S to HBM]
         A4[Load S from HBM]
-        A5[Compute P = softmax(S)]
+        A5[Compute softmax]
         A6[Write P to HBM]
         A7[Load P from HBM]
-        A8[Compute O = P×V]
+        A8[Compute output]
         A9[Write O to HBM]
     end
     
