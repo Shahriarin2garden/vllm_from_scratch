@@ -1,1496 +1,3811 @@
-# Lab 0.2: Prefill vs. Decode – The Two-Phase Engine
+# lab 0.2
+
+Status: Not started
 
 **Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
 
----
+# **Lab 0.2: Prefill vs. Decode – The Two-Phase Engine**
 
-## Introduction
+**A Comprehensive Guide to Autoregressive Inference, Scheduling, and Modern Optimizations**
 
-Large Language Model (LLM) inference is not a single uniform process. It splits into two physically distinct phases – **prefill** and **decode** – that behave differently on hardware and require different optimization strategies [1]. This lab dissects these phases, explains why they exist, and shows how modern systems (vLLM, TensorRT-LLM, TGI) manage them to achieve low latency and high throughput.
+### **Conceptual Overview: The "Read" and "Write" of AI**
+Before diving into the complex architecture diagram and mathematical formulas, let's establish a high-level intuition. LLM inference isn't a single uniform process; it's split into two physically distinct phases that behave very differently on hardware:
 
-You will learn the mathematical foundation of autoregressive generation, the role of the KV cache, the memory/compute characteristics of each phase, and the scheduling techniques that allow efficient batching. Through code examples and interactive exercises, you will internalize why LLM serving is challenging and how production systems overcome those challenges.
+1.  **Prefill (The "Reading" Phase)**
+    *   **Analogy:** Imagine a student reading an exam question. They read the whole paragraph at once to build context.
+    *   **Technical Reality:** The GPU receives the user's entire prompt (e.g., 500 tokens) simultaneously. It processes these in parallel using massive matrix multiplications. This phase is efficient and uses the GPU's compute cores heavily ("Compute-Bound").
 
-**Prerequisites:** Basic understanding of transformer architecture, Python, and familiarity with PyTorch. Knowledge of GPU architecture (HBM, compute units) is helpful but not required.
+2.  **Decode (The "Writing" Phase)**
+    *   **Analogy:** The student writes the answer one word at a time. They cannot write the 10th word before deciding on the 9th.
+    *   **Technical Reality:** The model generates one token at a time. Because the next token depends on the previous one, this process is strictly sequential. The GPU spends most of its time waiting for data to move from memory rather than computing ("Memory-Bound").
 
----
+### **Navigating the Architecture Diagram**
+The diagram below is a map of this two-phase engine. Key elements to focus on:
+*   **The Prompt Entry:** Represents the Prefill phase inputs.
+*   **The Recursion Loop:** Represents the Decode phase, where the output loops back to become the new input.
+*   **KV Cache:** The "short-term memory" block. This prevents the model from having to re-read the prompt for every single new word it generates.
 
-## Learning Objectives
+ ![architecture_02](architecture_02.png)
 
-By the end of this lab, you will be able to:
+<!-- ![architecture_02](architecture_02.jpg) -->
 
-1. Explain why LLM inference is split into prefill and decode phases.
-2. Describe the mathematical chain rule that forces sequential generation.
-3. Identify the compute‑bound nature of prefill and the memory‑bound nature of decode.
-4. Implement a simple KV cache and quantify its speedup.
-5. Analyze the memory access patterns that limit decode performance.
-6. Compare static, dynamic, and continuous batching strategies.
-7. Sketch the architecture of PagedAttention and chunked prefill.
-8. Predict the impact of batch size, sequence length, and model size on latency and throughput.
-9. Evaluate the trade‑offs of advanced optimizations like prefix caching and speculative decoding.
+## **1. Introduction: The Heartbeat of LLM Inference**
 
----
+### **1.1 The Autoregressive Loop: Mathematical Foundation**
 
-## Prologue: The Challenge
+The core of LLM inference is the **autoregressive generation process**.
 
-You are an ML engineer at a startup that just launched a conversational AI assistant. Users love it, but the inference latency is too high – especially when many users chat simultaneously. Your CTO asks you to investigate: “Why does generating a 100‑token answer take 2 seconds even on an A100? And why does the first token appear quickly but the rest trickle out slowly?”
+**Concept Intuition:**
+"Autoregressive" simply means "self-referencing". The model predicts the next word based on its own previous predictions. It's like a chain reaction where the output of step 1 becomes the input for step 2. You cannot skip ahead because step 10 requires specific knowledge of step 9.
 
-You suspect the answer lies in how the model generates text. Unlike traditional deep learning models that process all inputs in one forward pass, an LLM must produce tokens one by one. This inherent sequentiality creates two distinct phases: one that processes the user’s prompt in parallel, and another that generates each new token using the results of the previous step. Understanding these phases is the key to optimizing your system.
+Mathematically, this is defined by the probability chain rule:
 
-In this lab, you will step into the role of a performance engineer. You will dissect the two‑phase engine, run experiments, and learn the techniques that frameworks like vLLM use to deliver fast, scalable inference.
+```
+P(w₁, w₂, ..., w_T) = Π P(w_t | w₁, w₂, ..., w_{t-1})
 
----
-
-## Environment Setup
-
-Before you begin, set up a Python environment with the required libraries. All code examples use PyTorch; you can run them on a CPU, but a GPU will make the performance differences more visible.
-
-```bash
-# Create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install packages
-pip install torch transformers matplotlib numpy
 ```
 
-Optionally, install `vllm` and `tensorrt-llm` if you want to explore production systems later, but they are not required for the core exercises.
+Each token generation depends on the entire preceding sequence, creating a **sequential dependency** that cannot be parallelized across tokens. This fundamental constraint leads to the two-phase architecture.
 
-Create a working directory for your code:
+**Why This Matters:**
+- **Training vs Inference**: During training, we can compute all positions in parallel because we have the full sequence. During inference, we must generate one token at a time.
+- **Memory-Compute Trade-off**: We trade memory (storing KV cache) for compute (avoiding recomputation).
+- **Latency Impact**: Each token requires a full forward pass through the model, making generation inherently sequential.
 
-```bash
-mkdir lab0.2
-cd lab0.2
-touch prefill.py decode.py scheduler.py
+**Real-World Example:**
+For GPT-3 (175B parameters) generating 100 tokens:
+- Without KV cache: ~500 seconds (recomputing everything)
+- With KV cache: ~5 seconds (using cached computations)
+- **100× speedup** from caching alone!
+
+> **Research Reference**: "Attention Is All You Need" (Vaswani et al., 2017) - The foundational paper that introduced the Transformer architecture and autoregressive generation.
+
+### **1.2 Computational Graph Decomposition**
+
+**Concept Intuition:**
+This formula describes exactly what happens inside a single layer of the model for one specific moment in time ($t$). It says: "To calculate the current state ($h_t$), I need the previous state ($h_{t-1}$) plus specific memories (Keys and Values) from everything that happened in the past ($K_{1:t-1}, V_{1:t-1}$)."
+
+The forward pass of a Transformer layer for token generation can be represented as:
+
+```
+h_t = TransformerLayer(h_{t-1}, K_{1:t-1}, V_{1:t-1})
+
 ```
 
----
+Where:
 
-## Chapter 1: Autoregressive Foundation
+- `h_t` = hidden state at position t
+- `K_{1:t-1}`, `V_{1:t-1}` = cached Key/Value vectors from previous tokens
 
-### What You Will Build
+**Deep Dive: Why Cache Keys and Values?**
 
-In this chapter, you will calculate KV cache memory requirements and understand the speedup from caching. You will not write code yet, but you will perform mental calculations and predict outcomes.
-
-### 1.1 Why Generation Must Be Sequential
-
-Every LLM is trained to predict the next token given the previous ones. During inference, this becomes a chain: the output of step 1 is the input for step 2. This is the **autoregressive property** [1].
-
-```mermaid
-graph LR
-    A[Token 1] --> B[Model] --> C[Token 2]
-    C --> D[Model] --> E[Token 3]
-    E --> F[...]
+In the attention mechanism:
+```
+Attention(Q, K, V) = softmax(QKᵀ/√d_k)V
 ```
 
-The probability of a whole sequence is the product of conditional probabilities, as established in the foundational Transformer paper “Attention Is All You Need” [1]:
+For each new token:
+- **Query (Q)**: Computed fresh for the current token only
+- **Keys (K)**: Needed from ALL previous tokens (including current)
+- **Values (V)**: Needed from ALL previous tokens (including current)
 
-$$
-P(w_1, w_2, ..., w_T) = \prod_{t=1}^{T} P(w_t | w_1, ..., w_{t-1})
-$$
+Without caching, we'd recompute K and V for all previous tokens at every step:
+- Token 1: Compute K₁, V₁ (1 computation)
+- Token 2: Recompute K₁, V₁ + compute K₂, V₂ (2 computations)
+- Token 3: Recompute K₁, V₁, K₂, V₂ + compute K₃, V₃ (3 computations)
+- Token N: N computations
+- **Total: O(N²) complexity!**
 
-Because each probability depends on all previous tokens, we cannot compute tokens in parallel during inference. This sequential dependency is the root cause of the two-phase architecture.
+With caching:
+- Token 1: Compute and cache K₁, V₁
+- Token 2: Read K₁, V₁ from cache + compute K₂, V₂
+- Token 3: Read K₁, V₁, K₂, V₂ from cache + compute K₃, V₃
+- **Total: O(N) complexity!**
 
-### 1.2 Think First: Sequential Dependency
-
-**Question:** If you have a model that can process 1000 tokens in parallel during training, why can’t it generate 1000 tokens in parallel during inference?
-
-- Click to review
-    
-    During training, the entire correct sequence is available, so the model can compute all positions simultaneously using a causal mask. During inference, you don’t know the future tokens; each step’s output depends on the previous step’s sampled token. This creates a data dependency that forces sequential generation.
-    
-
-### 1.3 Computational Graph Decomposition
-
-The forward pass of a single transformer layer at time $t$ can be written as:
-
-$$
-h_t = \text{TransformerLayer}(h_{t-1}, K_{1:t-1}, V_{1:t-1})
-$$
-
-where $K_{1:t-1}, V_{1:t-1}$ are the key and value vectors from all previous tokens. If we had to recompute these vectors for every new token, the cost would be $O(T^2)$. This is why we cache them – the **KV cache** [2].
-
-```mermaid
-graph TD
-    subgraph Without Cache
-        A[Step 1] --> B[Compute K1,V1]
-        B --> C[Step 2] --> D[Compute K1,V1 again + K2,V2]
-        D --> E[Step 3] --> F[Compute K1,V1, K2,V2 again + K3,V3]
-    end
-    subgraph With Cache
-        G[Step 1] --> H[Compute & Store K1,V1]
-        H --> I[Step 2] --> J[Read K1,V1, Compute & Store K2,V2]
-        J --> K[Step 3] --> L[Read K1,V1,K2,V2, Compute & Store K3,V3]
-    end
-```
-
-### 1.4 The KV Cache: Trading Memory for Compute
-
-The KV cache eliminates redundant computation, reducing total cost from $O(T^2)$ to $O(T)$.
-
-**Performance Impact:**
+**Performance Impact Table:**
 
 | Sequence Length | Without Cache (ops) | With Cache (ops) | Speedup |
-| --- | --- | --- | --- |
-| 10 | 55 | 10 | 5.5× |
-| 100 | 5050 | 100 | 50.5× |
-| 1000 | 500500 | 1000 | 500.5× |
+|----------------|---------------------|------------------|----------|
+| 10 tokens | 55 | 10 | 5.5× |
+| 100 tokens | 5,050 | 100 | 50.5× |
+| 1000 tokens | 500,500 | 1,000 | 500.5× |
+| 2048 tokens | 2,098,176 | 2,048 | 1024× |
 
-**Think First:** For a 32‑layer model with hidden size 4096, how many bytes are needed to store the KV cache for a 1000‑token sequence? Assume FP16.
+> **Research Reference**: "Generating Long Sequences with Sparse Transformers" (Child et al., 2019) - Discusses the computational complexity of attention and caching strategies.
 
-- Click to calculate
-    
-    Each token produces a key and a value vector per layer. For each layer: $2 \times 4096 \times 2$ bytes = 16 KB per token (key + value). For 32 layers: $32 \times 16$ KB = 512 KB per token. For 1000 tokens: 512 MB.
-    
+### **1.3 From Mathematical Model to System Architecture**
 
-### 1.5 GPT Inference Process Diagram
+The two-phase architecture emerges naturally from this formulation:
 
-The following diagram from the ORCA paper illustrates the autoregressive inference process for a 3-layer GPT model [10]:
-
-```mermaid
-graph TD
-    subgraph "Iteration 1 (Prefill)"
-        I1["Input: I think this"] --> L1_1[Layer 1]
-        L1_1 --> L2_1[Layer 2]
-        L2_1 --> L3_1[Layer 3]
-        L3_1 --> O1["Output: is"]
-    end
-    subgraph "Iteration 2 (Decode)"
-        I2["Input: I think this is"] --> L1_2[Layer 1]
-        L1_2 --> L2_2[Layer 2]
-        L2_2 --> L3_2[Layer 3]
-        L3_2 --> O2["Output: awesome"]
-    end
-    subgraph "Iteration 3 (Decode)"
-        I3["Input: I think this is awesome"] --> L1_3[Layer 1]
-        L1_3 --> L2_3[Layer 2]
-        L2_3 --> L3_3[Layer 3]
-        L3_3 --> O3["Output: <EOS>"]
-    end
-    O1 --> I2
-    O2 --> I3
-```
-
-**Diagram Explanation:** This diagram shows a 3-layer GPT model processing a request through multiple iterations. The first iteration (prefill) processes all input tokens ("I think this") in parallel and generates the first output token ("is"). Subsequent iterations (decode) process one token at a time, using previously generated tokens as input. Nodes with the same color represent the same model layer executing at different time steps. This visualization makes clear why inference must be sequential—each iteration depends on the output of the previous one.
-
-### 1.6 KV Cache Evolution Diagram
-
-The following diagram illustrates how the KV cache evolves during the decode phase:
-
-```mermaid
-graph LR
-    subgraph Step1["Step 1: After Prefill"]
-        B0_1["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_1["Block 1: [K4,V4][K5,V5][K6,V6][____]"] 
-    end
-    subgraph Step2["Step 2: First Decode"]
-        B0_2["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_2["Block 1: [K4,V4][K5,V5][K6,V6][K7,V7]"] 
-    end
-    subgraph Step3["Step 3: Second Decode"]
-        B0_3["Block 0: [K0,V0][K1,V1][K2,V2][K3,V3]"]
-        B1_3["Block 1: [K4,V4][K5,V5][K6,V6][K7,V7]"]
-        B2_3["Block 2: [K8,V8][____][____][____]"] 
-    end    
-    Step1 --> Step2 --> Step3
-```
-
-**Diagram Explanation:** This diagram shows the progressive growth of the KV cache during decode. After prefill with 7 tokens, logical blocks 0 and 1 are partially filled. The first decode step adds one token, filling the remaining slot in block 1. The second decode step requires allocating block 2. This incremental allocation avoids pre-allocating memory for the maximum possible sequence length, saving significant memory when actual output lengths are shorter.
-
-### 1.7 GPU Memory Allocation in LLM Inference
-
-The following diagram from the PagedAttention paper shows how memory is allocated in LLM inference on an A100 GPU [7]:
-
-```mermaid
-pie title "A100 GPU Memory Allocation for 13B Model Inference"
-    "Model Parameters" : 65
-    "KV Cache" : 30
-    "Activations & Other" : 5
-```
-
-**Diagram Explanation:** This pie chart illustrates the memory breakdown for a 13B parameter model on an A100 GPU. Model parameters consume the majority (65%) of GPU memory and are statically allocated. The KV cache, despite being dynamically allocated based on sequence length, consumes a significant portion (30%). This highlights why efficient KV cache management is critical—it's the second-largest memory consumer and grows unpredictably with request length.
-
-### 1.8 vLLM Memory Efficiency Comparison
-
-The following diagram compares vLLM's memory usage against other systems:
-
-```mermaid
-graph LR
-    subgraph "Memory Usage vs Batch Size"
-        FT["FasterTransformer: Linear growth, high waste"]
-        Orca["Orca: Reduced waste, some fragmentation"]
-        vLLM["vLLM: Near-optimal, minimal fragmentation"]
-    end
-```
-
-**Diagram Explanation:** This comparison shows how different systems handle memory as batch size increases. FasterTransformer shows steep memory growth due to pre-allocation. Orca improves but suffers from fragmentation. vLLM with PagedAttention achieves near-linear scaling, enabling much larger batch sizes within the same memory budget.
-
-### 1.9 Internal and External Fragmentation in KV Cache
-
-The following diagram illustrates the fragmentation problem in traditional KV cache allocation:
-
-```mermaid
-graph TD
-    subgraph "Memory Before"
-        M1["Request A: 2048 slots allocated, 10 used → 2038 wasted (internal)"]
-        M2["Request B: 512 slots allocated, 5 used → 507 wasted (internal)"]
-        M3["Free: 1024 slots (fragmented into small pieces)"]
-    end
-    subgraph "New Request C needs 1024 contiguous slots"
-        M4["Cannot allocate despite 1024 total free (external fragmentation)"]
-    end
-    subgraph "Result"
-        Frag1["Internal fragmentation: 2545 slots wasted"]
-        Frag2["External fragmentation: Cannot use 1024 free slots"]
-        Frag3["Underutilization: ~60% of allocated memory unused"]
-    end
-    M1 & M2 & M3 --> M4
-    M2 & M4 --> Frag1
-    M3 & M4 --> Frag2
-    M2 & M4 --> Frag3
-```
-
-**Diagram Explanation:** This diagram shows the fragmentation problem in traditional contiguous KV cache allocation. Request A pre-allocates 2048 slots but only uses 10, wasting 2038 slots internally. Request B pre-allocates 512 slots but only uses 5, wasting 507 slots. Even though total free memory (1024 slots) exceeds what Request C needs, external fragmentation prevents allocating a contiguous 1024-slot block. This motivates PagedAttention's block-based approach.
-
-### 1.10 From Mathematics to Two Phases
-
-The KV cache leads naturally to two phases:
-
-1. **Prefill** – Process the entire prompt, compute and store the initial $K_{1:S}, V_{1:S}$.
-2. **Decode** – Generate one new token at a time, using the cache to avoid recomputation.
-
-```mermaid
-flowchart LR
-    Prompt --> P[Prefill Phase<br/>Parallel compute KV for prompt]
-    P --> Cache[KV Cache]
-    Cache --> D[Decode Phase<br/>Sequential generation]
-    D --> Token[Next Token]
-    Token --> D
-```
-
-### 1.11 Architecture Diagram
-
-The diagram below illustrates the two-phase inference engine with modern optimizations.
-
-![architecture_02](https://www.notion.soarchitecture_02.png)
-
-architecture_02
-
-> **Note:** The diagram shows FlashAttention and PagedAttention applied during both phases, with the KV cache serving as the bridge between prefill and decode. Time-to-First-Token (TTFT) is determined by prefill, while Time-per-Output-Token (TPOT) is determined by decode.
-> 
-
-### 1.12 Test and Verify
-
-**Predict:** For a 2048‑token sequence and a 7B model (32 layers, hidden size 4096), what is the approximate KV cache size in GB? Use FP16.
-
-- Click to verify
-    
-    Cache size per token = 32 layers × 2 (key+value) × 4096 × 2 bytes = 32 × 2 × 4096 × 2 = 524,288 bytes ≈ 0.5 MB.
-    
-    For 2048 tokens: 2048 × 0.5 MB = 1024 MB = 1 GB.
-    
-
-### 1.13 Checkpoint
-
-**Self-Assessment:**
-- [ ] I can explain why inference must be sequential.
-- [ ] I can write the probability chain rule.
-- [ ] I can describe the purpose of the KV cache.
-- [ ] I can compute the speedup from caching for a given sequence length.
-- [ ] I can estimate the memory required for KV cache.
-
----
-
-## Chapter 2: The Prefill Phase – Compute‑Bound Parallelism
-
-### What You Will Build
-
-You will implement a simplified prefill that computes attention for a prompt and populates the KV cache. You will measure its arithmetic intensity and confirm it is compute‑bound.
-
-### 2.1 Context
-
-The prefill phase processes the user’s prompt in one shot. Because the entire prompt is available, the model can perform massive matrix multiplications, fully utilizing the GPU’s compute units. This phase is **compute‑bound** [3].
-
-### 2.2 Think First: Parallelism
-
-**Question:** Why is prefill able to use parallelism while decode cannot?
-
-- Click to review
-    
-    Prefill has all tokens available simultaneously, so it can compute attention scores for all positions in parallel using matrix multiplication. Decode must compute one token at a time because each new token depends on the previous one.
-    
-
-### 2.3 Prefill Phase Data Flow Diagram
-
-The following diagram from FlashInfer documentation illustrates the prefill phase data flow:
-
-```mermaid
-graph TD
-    subgraph "Prefill Phase: Multiple Query Tokens"
-        Q["Query: [qo_len, num_heads, head_dim]"]
-        K["Key: [kv_len, num_heads, head_dim]"]
-        V["Value: [kv_len, num_heads, head_dim]"]
-        Q --> Attn["Attention Computation"]
-        K --> Attn
-        V --> Attn
-        Attn --> Mask["Causal Masking"]
-        Mask --> Out["Output: [qo_len, num_heads, head_dim]"]
-        Out --> KVCache["Populate KV Cache"]
-    end
-```
-
-**Diagram Explanation:** This diagram shows the data flow during the prefill phase. The query tensor has shape `[qo_len, num_heads, head_dim]` where `qo_len` is the prompt length. All query tokens are processed in parallel against the key and value tensors. Causal masking ensures each token can only attend to previous tokens. The output includes embeddings for all prompt positions, and the KV cache is populated for future decode steps.
-
-### 2.4 Attention Computation
-
-The attention mechanism:
-
-$$
-\text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
-$$
-
-For a prompt of length $S$:
-
-- $Q,K,V \in \mathbb{R}^{S \times d_{\text{model}}}$
-- $QK^T \in \mathbb{R}^{S \times S}$ (quadratic complexity)
-
-```mermaid
-graph TD
-    subgraph AttentionComputation
-        A[Q: S×d] --> M1[MatMul Q×K^T]
-        B[K: S×d] --> M1
-        M1 --> S[Scores: S×S]
-        S --> SM[Softmax]
-        SM --> P[Probs: S×S]
-        P --> M2[MatMul P×V]
-        C[V: S×d] --> M2
-        M2 --> O[Output: S×d]
-    end
-```
-
-### 2.5 Prefill Kernel Architecture
-
-The following diagram illustrates the architecture of FlashInfer's prefill kernel:
-
-```mermaid
-graph TD
-    subgraph "Thread Block Organization"
-        TB["Thread Block"]
-        TB --> Warp1["Warp 1: Process query rows 0-15"]
-        TB --> Warp2["Warp 2: Process query rows 16-31"]
-        TB --> WarpN["Warp N: Process query rows ..."]
-    end
-    subgraph "Kernel Stages"
-        S1["Stage 1: Load Q tile to SRAM"]
-        S2["Stage 2: Async load K,V tile"]
-        S3["Stage 3: Compute QK^T (mma_sync)"]
-        S4["Stage 4: Causal mask + softmax"]
-        S5["Stage 5: Compute output with V"]
-        S6["Stage 6: Update attention state"]
-        S1 --> S2 --> S3 --> S4 --> S5 --> S6
-    end
-    subgraph "Memory Tiling"
-        Qtile["Q Tile: CTA_TILE_Q rows"]
-        KVTILE["KV Tile: CTA_TILE_KV cols"]
-    end
-```
-
-**Diagram Explanation:** This diagram shows the thread block organization in FlashInfer's prefill kernel. Each thread block processes a tile of query rows (`CTA_TILE_Q`) and a tile of KV columns (`CTA_TILE_KV`). Warps within the block distribute the query rows. The kernel operates in six stages: loading query data to shared memory, asynchronously loading key/value tiles, computing QK multiplication using tensor core `mma_sync` instructions, applying causal masking and softmax, computing the output with value tensors, and updating the attention state with online softmax statistics.
-
-### 2.6 FLOPs Breakdown
-
-Total FLOPs ≈ $2 N S \left(1 + \frac{S}{d_{\text{model}}}\right)$, where $N$ is the number of model parameters. The term $\frac{S}{d_{\text{model}}}$ is the quadratic attention cost.
-
-```mermaid
-pie title Prefill FLOPs Distribution
-    "QKV Projections" : 40
-    "Attention Scores (QK^T)" : 30
-    "Softmax" : 5
-    "Attention Apply (score·V)" : 25
-```
-
-### 2.7 Memory Hierarchy During Prefill
-
-Modern GPUs have a complex memory hierarchy. Understanding it is key to optimizing prefill.
+- **Prefill**: Compute `K_{1:S}`, `V_{1:S}` for prompt length S (parallelizable)
+- **Decode**: Iteratively compute `h_{S+1}`, `h_{S+2}`, ... using cached K/V
 
 ```mermaid
 flowchart TD
-    subgraph HBM[High Bandwidth Memory ~40-80GB<br/>Bandwidth: 1-2 TB/s]
-        W[Model Weights]
-        IO[Activations]
+    subgraph A[Mathematical Foundation]
+        direction TB
+        P["Chain Rule:<br/>P(w1..T) = ΠP(wt|w1..t-1)"]
+        G["Generation:<br/>wt = argmax P(wt|w1..t-1)"]
     end
-    subgraph L2[L2 Cache ~40MB<br/>Bandwidth: 4-8 TB/s]
-        TC[Tiling Cache]
+
+    subgraph B[Computational Decomposition]
+        CD["Forward Pass:<br/>ht = Transformer(ht-1, K1:t-1, V1:t-1)"]
     end
-    subgraph L1[L1/SRAM ~10-20MB per SM<br/>Bandwidth: 10-20 TB/s]
-        Reg[Register File]
+
+    subgraph SA[System Architecture]
+        direction LR
+        Pre["Prefill Phase<br/>Parallel Compute K1:S, V1:S"]
+        Dec["Decode Phase<br/>Iterative ht using Cache"]
     end
-    subgraph SM[Streaming Multiprocessor]
-        TCU[Tensor Cores<br/>Compute: 312 TFLOPS FP16]
-        FPU[FP32 Units]
+
+    A --> B --> SA
+
+    subgraph D[Hardware Mapping]
+        CPU["CPU: Scheduling"]
+        GPU["GPU: Compute"]
+        MEM["VRAM: KV Cache"]
     end
+
+    SA --> D
+
+```
+
+*Diagram 1.1: From Mathematical Model to System Architecture.*
+
+**Detailed Explanation for Researchers:**
+This diagram bridges the gap between theoretical probability and physical silicon.
+1.  **Mathematical Dependency:** The "Chain Rule" creates a strict temporal dependency. We cannot compute $P(w_5)$ until $w_4$ is effectively sampled (argmax). This forces the sequential loop.
+2.  **Computational Split:** The diagram bifurcates the workload into:
+    *   **Prefill:** $P(w_{1:S} | \text{prompt})$ is computed all at once using causal masking. This allows dense matrix multiplications ($S \times S$), maximizing Tensor Core utilization ($O(S^2)$ parallel work).
+    *   **Decode:** $P(w_{t} | w_{1:t-1})$ is computed one by one. This reduces the problem to Matrix-Vector multiplication ($1 \times N$), which is severely memory bandwidth limited.
+3.  **Hardware Implications:** The CPU handles the complex control logic (scheduling), while the GPU is treated differently in phrases: as a parallel throughput engine during Prefill, and a latency-sensitive sequential engine during Decode. The VRAM acts as the state carrier (KV Cache) bridging these two distinct operational modes.
+
+### **1.4 The Evolution of Inference Systems**
+
+```mermaid
+timeline
+    title Evolution of LLM Inference Systems
+    2018-2020 : Naive Inference : Full recomputation
+    2020-2021 : KV Cache : Cached attention states
+    2021-2022 : Dynamic Batching : Improved utilization
+    2022-2023 : Continuous Batching : vLLM, TGI
+    2023-2024 : Disaggregated Architectures : Specialized hardware
+
+```
+
+*Diagram 1.2: Historical Evolution of LLM Inference.* This timeline shows how inference systems evolved from naive recomputation to sophisticated disaggregated architectures.
+
+### **1.5 System Components Overview**
+
+```mermaid
+flowchart TD
+    subgraph S[Software Stack]
+        API["API Layer<br/>REST/gRPC"]
+        SCH["Scheduler<br/>Continuous Batching"]
+        MEM["Memory Manager<br/>PagedAttention"]
+        KER["Kernel Optimizer<br/>FlashAttention, etc."]
+    end
+
+    subgraph H[Hardware Stack]
+        PCIE["PCIe/NVLink<br/>Interconnect"]
+        HBM["HBM Memory<br/>Bandwidth Optimized"]
+        SM["Streaming Multiprocessors<br/>Compute Optimized"]
+        TC["Tensor Cores<br/>Mixed Precision"]
+    end
+
+    S <--> H
+
+    subgraph M[Metrics]
+        TTFT["Time-To-First-Token"]
+        TPOT["Time-Per-Output-Token"]
+        THR["Throughput<br/>Tokens/sec/GPU"]
+    end
+
+    S --> M
+
+```
+
+*Diagram 1.3: Complete System Stack.*
+
+**Detailed Explanation for Researchers:**
+This stack represents the "vLLM-style" architecture that has become standard since 2023.
+*   **Software Layer:**
+    *   **Scheduler:** Unlike traditional HTTP servers, this scheduler is *iteration-level* aware. It doesn't just queue requests; it injects new requests into running batches (Continuous Batching) at every forward pass boundary.
+    *   **Memory Manager:** The critical innovation here is **PagedAttention** (mapping logical tokens to non-contiguous physical blocks), which virtually eliminates external memory fragmentation.
+    *   **Kernel Optimizer:** Custom CUDA kernels (like FlashAttention) are required because standard PyTorch implementations are too slow due to excessive HBM read/writes.
+*   **Hardware Layer:**
+    *   **HBM vs. Compute:** The diagram implicitly highlights the bottleneck. The connection between HBM and SM (Streaming Multiprocessors) is the limiting factor for decoding (Bandwidth), while the Tensor Cores are the limiting factor for prefill (Compute).
+    *   **Throughput vs. Latency:** The system optimizes logic (Softmax, Sampling) on FP32 units/CPU, while heavy lifting (MatMul) stays on Tensor Cores.
+
+### **1.6 The Inference Pipeline**
+
+```mermaid
+flowchart LR
+    subgraph P[Pipeline Stages]
+        R["Request Arrival"]
+        T["Tokenization"]
+        B["Batching"]
+        PF["Prefill Execution"]
+        DC["Decode Execution"]
+        DT["Detokenization"]
+        S["Streaming Response"]
+    end
+
+    R --> T --> B --> PF --> DC --> DT --> S
+
+    subgraph L[Latency Contributors]
+        L1["Network"]
+        L2["Queueing"]
+        L3["Compute Prefill"]
+        L4["Compute Decode"]
+        L5["Serialization"]
+    end
+
+    P --> L
+
+```
+
+*Diagram 1.4: End-to-End Inference Pipeline.* This diagram shows all stages from request arrival to response streaming, highlighting latency contributors at each stage.
+
+## **2. The Prefill Phase: Compute-Bound Parallelism**
+
+### **2.1 Mathematical Foundations of Attention**
+
+**Concept Intuition:**
+"Attention" is how the model connects words to each other. In the sentence "The bank of the river," the word "bank" needs to attend to "river" to know it's not a financial bank. 
+Mathematically, this uses three vectors:
+*   **Query (Q):** What I am looking for (e.g., current word).
+*   **Key (K):** What I contain (e.g., potential definitions).
+*   **Value (V):** What I actually mean.
+The dot product $QK^T$ measures "compatibility" or relevance between words.
+
+The attention mechanism computes:
+
+```
+Attention(Q, K, V) = softmax(QK^T/√d_k)V
+
+```
+
+Where for prompt length S:
+
+- Q, K, V ∈ ℝ^{S × d_model}
+- QK^T ∈ ℝ^{S × S} (quadratic complexity)
+
+### **2.2 FLOPs Analysis**
+
+**Concept Intuition:**
+FLOPs (Floating Point Operations) measure how much "math work" the hardware has to do.
+In the Prefill phase, the work grows mostly linearly with the size of the model ($N$) and the length of the prompt ($S$). However, the "attention" part has a quadratic term ($S \times S$), meaning if you double the prompt length, the attention work quadruples. This is why very long prompts become slow.
+
+For a model with N parameters processing prompt length S:
+
+```
+Total FLOPs ≈ 2 × N × S × (1 + S/d_model)
+
+```
+
+The `S/d_model` term represents the quadratic attention cost.
+
+### **2.3 Memory Hierarchy During Prefill**
+
+**Concept Intuition:**
+Think of the GPU memory system like a kitchen:
+*   **HBM (High Bandwidth Memory):** The pantry. Huge storage (40-80GB), but far away.
+*   **L2/L1 Cache:** The countertop. Small, but close and fast.
+*   **Registers:** The cutting board. Right in front of the chef (the processor).
+During Prefill, because we are processing so much data at once, the main challenge is keeping the "cutting board" busy without waiting for trips to the "pantry".
+
+```mermaid
+flowchart TD
+    subgraph HBM["High Bandwidth Memory ~40-80GB"]
+        W["Model Weights<br/>FP16/INT8"]
+        IO["Intermediate Outputs<br/>Activation Checkpointing"]
+    end
+
+    subgraph L2["L2 Cache ~40MB"]
+        TC["Tiling Cache<br/>For Large Matrices"]
+    end
+
+    subgraph L1["L1/SRAM ~10-20MB"]
+        Reg["Register File<br/>Tensor Core Operands"]
+    end
+
+    subgraph SM["Streaming Multiprocessor"]
+        TCU["Tensor Core Unit<br/>Matrix Multiply"]
+        FPU["FP32 Units<br/>Softmax, LayerNorm"]
+    end
+
     HBM --> L2 --> L1 --> SM
+
+    subgraph Dataflow["Typical Dataflow"]
+        direction LR
+        Load["Load Weights & Activations"]
+        Compute["Tensor Core GEMM"]
+        Store["Store Results"]
+    end
+
+    SM --> Dataflow
+
 ```
 
-**Arithmetic intensity** = total FLOPs / total bytes moved. For prefill, it is proportional to $S$, so for typical prompts ($S > 100$) it exceeds the GPU’s ops:byte ratio, making it compute‑bound.
+*Diagram 2.1: GPU Memory Hierarchy During Prefill.*
 
-### 2.8 Tiled Attention Computation
+**Detailed Explanation for Researchers:**
+This diagram illustrates why the Prefill phase is "Compute-Bound" and generally preferred by hardware.
+*   **Data Reuse:** In the prefill phase, we load model weights ($W$) from HBM once and reuse them for $S$ tokens (where $S$ is the sequence length, often > 1000).
+*   **Arithmetic Intensity:** The arithmetic intensity is approximately $S$. Since typical GPUs have a generic "Ops:Byte" ratio of ~100:1, as long as $S > 100$, we are fully utilizing the Tensor Cores.
+*   **SRAM (L1) Efficiency:** FlashAttention (and similar kernels) works by tiling the $Q, K, V$ matrices into keeping them in the fast L1/SRAM cache. This prevents the `Memory` block from becoming the bottleneck, allowing the `SM` (Streaming Multiprocessor) to run at near 100% utilization.
+*   **Contrast with Decode:** In the Decode phase (discussed later), $S=1$. This collapses the reuse factor, making the HBM link the bottleneck instead of the SMs.
 
-The following diagram illustrates tiled attention computation used in FlashAttention:
+### **2.4 Attention Computation Patterns**
 
 ```mermaid
-graph TD
-    subgraph "Tiled Matrix Multiplication"
-        QTile["Q Tile (Br × d)"]
-        KTile["K Tile (Bc × d)"]
-        VTile["V Tile (Bc × d)"]
-        QTile --> QK["Compute QK^T<br/>(Br × Bc)"]
-        KTile --> QK
-        QK --> SM["Softmax Statistics<br/>(running max, sum)"]
-        SM --> Attn["Attention Scores<br/>(Br × Bc)"]
-        Attn --> Out["Partial Output<br/>(Br × d)"]
-        VTile --> Out
-        Out --> Merge["Merge with running output"]
+flowchart TD
+    subgraph FullAttention["Full Attention - Prefill"]
+        Q["Q: S × d"]
+        K["K: S × d"]
+
+        Q --> MM1["Matrix Multiply<br/>FLOPs: 2S²d"]
+        K --> MM1
+
+        MM1 --> SM["Softmax<br/>FLOPs: 3S²"]
+        SM --> MM2["Matrix Multiply<br/>FLOPs: 2S²d"]
+
+        V["V: S × d"] --> MM2
+        MM2 --> O["Output: S × d"]
     end
+
+    subgraph Memory["Movement Costs"]
+        M1["Load Q,K,V: 3Sd × bytes"]
+        M2["Store Attn: S² × bytes"]
+        M3["Store O: Sd × bytes"]
+    end
+
+    FullAttention --> Memory
+
+    subgraph ArithIntensity["Arithmetic Intensity"]
+        AI["AI = Total FLOPs / Total Bytes<br/>For S=1024, d=128, FP16:<br/>AI ≈ 180 FLOPs/Byte"]
+    end
+
+    Memory --> ArithIntensity
+
 ```
 
-**Diagram Explanation:** This diagram shows the tiled approach used in FlashAttention. Instead of computing the full S×S attention matrix, the computation is broken into tiles that fit in shared memory. Each tile computes QK^T for a subset of query and key positions, applies softmax incrementally, and computes partial output. This reduces memory footprint from quadratic to linear and enables better cache utilization.
+*Diagram 2.2: Attention Computation and Memory Patterns.* This diagram breaks down the FLOPs and memory movement during full attention computation, showing why prefill is compute-bound.
 
-### 2.9 FlashAttention: IO-Aware Attention
-
-FlashAttention, introduced by Dao et al. (2022) [3], is an IO-aware exact attention algorithm that uses tiling to reduce memory reads/writes. It achieves 2-4× speedup compared to PyTorch standard attention.
+### **2.5 KV Cache Population Strategy**
 
 ```mermaid
-graph TD
-    subgraph StandardAttention[Standard Attention]
-        A1[Load Q,K,V from HBM] --> A2[Compute S = QK^T]
-        A2 --> A3[Write S to HBM]
-        A3 --> A4[Load S from HBM]
-        A4 --> A5[Compute P = softmax(S)]
-        A5 --> A6[Write P to HBM]
-        A6 --> A7[Load P from HBM]
-        A7 --> A8[Compute O = PV]
-        A8 --> A9[Write O to HBM]
+flowchart TD
+    subgraph KVCache["KV Cache Population"]
+        direction LR
+
+        subgraph L1["Layer 1"]
+            K1["K Cache: B×S×H×D_h"]
+            V1["V Cache: B×S×H×D_h"]
+        end
+
+        subgraph L2["Layer 2"]
+            K2["K Cache"]
+            V2["V Cache"]
+        end
+
+        subgraph LN["Layer N"]
+            KN["K Cache"]
+            VN["V Cache"]
+        end
     end
 
-    subgraph FlashAttention[FlashAttention]
-        B1[Load Q tile to SRAM] --> B2[Load K tile to SRAM]
-        B2 --> B3[Compute on tile, update statistics]
-        B3 --> B4[Load V tile, compute partial output]
-        B4 --> B5[Write final O to HBM]
+    subgraph Compute["Compute Pattern"]
+        Para["Parallel Across:<br/>• Batch Dimension<br/>• Sequence Dimension<br/>• Head Dimension"]
+
+        Seq["Sequential Across:<br/>• Layer Dimension"]
     end
+
+    Compute --> KVCache
+
+    subgraph Layout["Memory Layout Options"]
+        Inter["Interleaved:<br/>[B][S][H][D_h]"]
+        Split["Split Heads:<br/>[B][H][S][D_h]"]
+        Block["Blocked:<br/>For PagedAttention"]
+    end
+
+    KVCache --> Layout
+
 ```
 
-**Memory savings:** FlashAttention reduces memory footprint from quadratic to linear in sequence length. At sequence length 4K, memory savings reach 20× [3].
+*Diagram 2.3: KV Cache Population Strategy.* This diagram shows how KV cache is populated across layers during prefill and discusses memory layout options.
 
-### 2.10 Implementation: Naive vs FlashAttention
+### **2.6 Prefill Kernel Optimization Techniques**
 
-Complete the following code for a naive attention forward pass. Fill in the blanks.
+```mermaid
+flowchart TD
+    subgraph Opt["Optimization Techniques"]
+        Flash["FlashAttention<br/>IO-Aware Algorithm"]
+        Tiling["Tiling<br/>Decompose Large Matrices"]
+        Quant["Quantization<br/>FP8/INT4 for GEMM"]
+        Fusion["Kernel Fusion<br/>Combine Operations"]
+    end
+
+    subgraph FlashDetail["FlashAttention Details"]
+        direction LR
+        Load["Load Tile to SRAM"]
+        Compute["Compute on Tile"]
+        Write["Write Output"]
+        Softmax["Tiled Softmax"]
+    end
+
+    Flash --> FlashDetail
+
+    subgraph Perf["Performance Impact"]
+        Speed["3-5× Speedup"]
+        Mem["5-10× Memory Reduction"]
+    end
+
+    Opt --> Perf
+
+    subgraph Code["Code Example"]
+        Pseudo["Pseudo-code for tiled attention"]
+        Real["Real kernel implementation"]
+    end
+
+```
+
+*Diagram 2.4: Prefill Kernel Optimizations.* This diagram categorizes optimization techniques for prefill kernels, with focus on FlashAttention.
+
+### **2.7 Implementation: From Naive to Optimized**
+
+**2.7.1 Naive PyTorch Implementation**
 
 ```python
-import torch
-import torch.nn.functional as F
+# Naive attention implementation - educational purpose only
+def naive_attention(q, k, v, mask=None):
+    """
+    Naive attention implementation showing the quadratic complexity.
 
-def naive_attention(q, k, v):
-    # q, k, v: [batch, seq_len, num_heads, head_dim]
-    batch, seq_len, num_heads, head_dim = q.shape
+    Args:
+        q: Query tensor [batch, seq_len, num_heads, head_dim]
+        k: Key tensor [batch, seq_len, num_heads, head_dim]
+        v: Value tensor [batch, seq_len, num_heads, head_dim]
+        mask: Optional attention mask
 
-    # Reshape for matmul
+    Returns:
+        Attention output tensor
+    """
+    batch_size, seq_len, num_heads, head_dim = q.shape
+
+    # Reshape for matrix multiplication
     q = q.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    # Compute scores (QK^T)
-    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # Q1: What shape?
+    # Compute attention scores - QUADRATIC OPERATION
+    # [batch, num_heads, seq_len, head_dim] @ [batch, num_heads, head_dim, seq_len]
+    # = [batch, num_heads, seq_len, seq_len]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
 
-    # Apply causal mask
-    mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
-    scores = scores.masked_fill(mask, float('-inf'))
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float('-inf'))
 
-    # Softmax
-    attn_weights = F.softmax(scores, dim=-1)  # Q2: Which dimension?
+    # Softmax - also quadratic
+    attention_weights = F.softmax(scores, dim=-1)
 
-    # Apply to values
-    out = torch.matmul(attn_weights, v)  # Q3: What is the output shape?
+    # Apply attention to values
+    output = torch.matmul(attention_weights, v)
 
-    return out.transpose(1, 2)
+    return output.transpose(1, 2)  # Back to [batch, seq_len, num_heads, head_dim]
+
 ```
 
-- Click for solutions
-    
-    **Q1:** `[batch, num_heads, seq_len, seq_len]`
-    
-    **Q2:** `dim=-1` (over the last dimension, i.e., over keys)
-    
-    **Q3:** `[batch, num_heads, seq_len, head_dim]` after transpose becomes `[batch, seq_len, num_heads, head_dim]`
-    
-
-Now, compare with FlashAttention using PyTorch’s built‑in implementation (available in 2.0+):
+**2.7.2 FlashAttention Implementation (Conceptual)**
 
 ```python
-def flash_attention(q, k, v):
+# Conceptual FlashAttention implementation based on the paper
+def flash_attention_impl(Q, K, V, block_size=256):
+    """
+    Conceptual FlashAttention implementation showing tiling strategy.
+
+    Based on: <https://arxiv.org/abs/2205.14135>
+    """
+    batch_size, seq_len, num_heads, head_dim = Q.shape
+    O = torch.zeros_like(Q)
+    L = torch.zeros(batch_size, num_heads, seq_len)
+    M = torch.full((batch_size, num_heads, seq_len), float('-inf'))
+
+    # Tile over sequence length
+    for block_start in range(0, seq_len, block_size):
+        block_end = min(block_start + block_size, seq_len)
+
+        # Load tile from HBM to SRAM
+        Q_tile = Q[:, block_start:block_end, :, :]
+
+        # Tile over key/value length
+        for kv_start in range(0, seq_len, block_size):
+            kv_end = min(kv_start + block_size, seq_len)
+
+            # Load K, V tiles
+            K_tile = K[:, kv_start:kv_end, :, :]
+            V_tile = V[:, kv_start:kv_end, :, :]
+
+            # Compute attention for this tile
+            S_tile = torch.matmul(Q_tile, K_tile.transpose(-2, -1)) / math.sqrt(head_dim)
+
+            # Update running statistics
+M_new = torch.maximum(M[:, :, block_start:block_end], S_tile.max(dim=-1, keepdim=True).values)
+            # Numerical stability: clamp to prevent overflow
+            S_shifted = torch.clamp(S_tile - M_new, min=-50, max=50)
+            exp_S = torch.exp(S_shifted)
+            P_tile = exp_S / (torch.exp(M[:, :, block_start:block_end] - M_new) * L[:, :, block_start:block_end].unsqueeze(-1) +
+                            exp_S.sum(dim=-1, keepdim=True))
+
+            # Update output
+            O[:, block_start:block_end, :, :] = (
+                L[:, :, block_start:block_end].unsqueeze(-1) /
+                torch.exp(M[:, :, block_start:block_end] - M_new).unsqueeze(-1) *
+                O[:, block_start:block_end, :, :] +
+                torch.matmul(P_tile, V_tile)
+            )
+
+            # Update L and M
+            L[:, :, block_start:block_end] = (
+                torch.exp(M[:, :, block_start:block_end] - M_new) *
+                L[:, :, block_start:block_end] +
+                exp_S.sum(dim=-1)
+            )
+            M[:, :, block_start:block_end] = M_new.squeeze(-1)
+
+    return O
+
+# Real FlashAttention usage in PyTorch 2.0+
+import torch.nn.functional as F
+
+def optimized_attention(q, k, v, is_causal=True):
+    """
+    Using PyTorch's built-in FlashAttention.
+    """
     return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+        q, k, v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=None
     )
+
 ```
 
-For more control, you can use the official FlashAttention package [4]:
+**2.7.3 Triton Implementation Example**
 
 ```python
-from flash_attn.flash_attention import FlashAttention
+# Triton kernel for fused attention (simplified)
+# Based on OpenAI Triton examples: <https://github.com/openai/triton>
+import triton
+import triton.language as tl
 
-flash_attn = FlashAttention()
-output = flash_attn(q, k, v)
+@triton.jit
+def _attn_fwd(
+    Q, K, V, sm_scale,
+    Out,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_oz, stride_oh, stride_om, stride_on,
+    Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Forward pass of attention kernel in Triton.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    # pointers to blocks
+    q_ptrs = Q + off_hz * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    k_ptrs = K + off_hz * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + off_hz * stride_vh + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vn
+
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    # load q
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    # loop over k, v
+    for start_n in range(0, N_CTX, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        # -- compute qk ---
+        k = tl.load(
+            k_ptrs + start_n * stride_kn,
+            mask=(start_n + offs_n)[:, None] < N_CTX,
+            other=0.0,
+        )
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, tl.trans(k))
+        qk *= sm_scale
+
+        # -- compute m_ij, p, l_ij ---
+        m_ij = tl.max(qk, 1)
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+
+        # -- update m_i and l_i --
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        beta = tl.exp(m_ij - m_i_new)
+        l_i_new = alpha * l_i + beta * l_ij
+
+        # -- update output accumulator --
+        # scale acc
+        acc_scale = l_i / l_i_new * alpha
+        acc = acc * acc_scale[:, None]
+
+        # update acc
+        v = tl.load(
+            v_ptrs + start_n * stride_vk,
+            mask=(start_n + offs_n)[:, None] < N_CTX,
+            other=0.0,
+        )
+        p = p.to(v.dtype)
+        acc += tl.dot(p, v) * (beta / l_i_new)[:, None]
+
+        # update m_i and l_i
+        m_i = m_i_new
+        l_i = l_i_new
+
+    # store results
+    out_ptrs = Out + off_hz * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
+    tl.store(out_ptrs, acc, mask=offs_m[:, None] < N_CTX)
+
+class Attention(torch.nn.Module):
+    def __init__(self, dropout=0.0):
+        super().__init__()
+        self.dropout = dropout
+
+    def forward(self, q, k, v):
+        # shape checks
+        assert q.dim() == 4
+
+        # optimized path
+        if _attn_fwd is not None and q.is_cuda:
+            # call triton kernel
+            output = torch.empty_like(q)
+            grid = lambda META: (triton.cdiv(q.shape[2], META['BLOCK_M']), q.shape[0] * q.shape[1])
+            _attn_fwd[grid](
+                q, k, v, 1.0 / math.sqrt(k.shape[-1]),
+                output,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+                q.shape[0], q.shape[1], k.shape[2],
+                BLOCK_M=128, BLOCK_N=64, BLOCK_DMODEL=q.shape[-1],
+                num_warps=4, num_stages=1,
+            )
+            return output
+        else:
+            # fallback
+            return optimized_attention(q, k, v)
+
 ```
 
-### 2.11 FlashAttention Speedup and Memory Savings
-
-The official FlashAttention benchmarks show significant improvements across different GPUs [4]:
-
-```mermaid
-graph LR
-    subgraph A100[A100 Speedup]
-        direction TB
-        S1[Seq Len 512: 2.5×]
-        S2[Seq Len 1K: 3×]
-        S3[Seq Len 2K: 3.5×]
-        S4[Seq Len 4K: 4×]
-    end
-
-    subgraph T4[T4 Speedup]
-        direction TB
-        T1[Seq Len 512: 3×]
-        T2[Seq Len 1K: 3.5×]
-        T3[Seq Len 2K: 4×]
-        T4[Seq Len 4K: 4.5×]
-    end
-```
-
-### 2.12 Multi-Query and Grouped-Query Attention
-
-Modern models often use **Multi-Query Attention (MQA)** or **Grouped-Query Attention (GQA)** to reduce KV cache size and memory bandwidth. Instead of having separate key/value heads for each query head, they share keys and values across groups of query heads [5].
-
-```mermaid
-graph TD
-    subgraph MHA[Multi-Head Attention]
-        Q1[Query head 1] --> K1[Key head 1] & V1[Value head 1]
-        Q2[Query head 2] --> K2[Key head 2] & V2[Value head 2]
-    end
-    subgraph GQA[Grouped-Query Attention]
-        GQ1[Query head 1] --> K1[Key head 1] & V1[Value head 1]
-        GQ2[Query head 2] --> K1 & V1
-    end
-    subgraph MQA[Multi-Query Attention]
-        MQ1[Query head 1] --> K[Single Key head] & V[Single Value head]
-        MQ2[Query head 2] --> K & V
-    end
-```
-
-**Memory savings:** For Llama 2 70B (8 KV heads, 64 query heads), GQA reduces KV cache size by 8× compared to MHA.
-
-### 2.13 Test and Verify
-
-**Predict:** For a prompt of 512 tokens and a model with 4096 hidden size, will prefill be compute‑bound or memory‑bound on an A100 (peak compute 312 TFLOPS, bandwidth 1.5 TB/s)? Assume arithmetic intensity threshold ≈ 100 FLOPs/byte.
-
-- Click to verify
-    
-    Compute‑bound. Arithmetic intensity ~ $S$ = 512, which is well above 100. The GPU will spend most of its time computing, not waiting for memory.
-    
-
-### 2.14 Experiment: Measure Arithmetic Intensity
-
-Write a simple script to measure the arithmetic intensity of prefill:
+### **2.8 vLLM's Prefill Implementation**
 
 ```python
-import torch
-import time
+# Based on vLLM's implementation: <https://github.com/vllm-project/vllm>
+# Simplified version showing key concepts
 
-def measure_arithmetic_intensity(model, input_ids):
-    # Profile forward pass
-    torch.cuda.reset_peak_memory_stats()
-    start_time = time.time()
-    output = model(input_ids)
-    end_time = time.time()
+class VLLMPrefillExecutor:
+    """vLLM's prefill executor with PagedAttention support."""
 
-    # Get memory stats
-    memory_stats = torch.cuda.memory_stats()
-    bytes_moved = memory_stats["active_bytes.all.current"]
+    def execute_prefill(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> List[SamplerOutput]:
+        """
+        Execute prefill for given sequence groups.
 
-    # Estimate FLOPs (simplified)
-    flops = estimate_model_flops(model, input_ids)
+        Reference: vLLM's model_runner.py
+        """
+        # 1. Prepare input tensors
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
+        seq_lens: List[int] = []
 
-    arithmetic_intensity = flops / bytes_moved
-    print(f"Arithmetic Intensity:{arithmetic_intensity:.2f} FLOPs/byte")
-    return arithmetic_intensity
+        for seq_group_metadata in seq_group_metadata_list:
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            seq_id = seq_ids[0]
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            token_chunk = seq_data.get_token_chunk()
+
+            # Add tokens
+            input_tokens.extend(token_chunk.token_ids)
+
+            # Compute positions
+            for i in range(len(token_chunk.token_ids)):
+                input_positions.append(seq_data.get_len() - len(token_chunk.token_ids) + i)
+
+            # Get block table
+            block_table = seq_group_metadata.block_tables[seq_id]
+
+            # Map positions to blocks
+            for i, position in enumerate(input_positions[-len(token_chunk.token_ids):]):
+                block_number = position // self.block_size
+                block_offset = position % self.block_size
+                slot = block_table[block_number] * self.block_size + block_offset
+                slot_mapping.append(slot)
+
+            seq_lens.append(seq_data.get_len())
+
+        # 2. Convert to tensors
+        input_tokens_tensor = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        input_positions_tensor = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.long, device=self.device)
+
+        # 3. Execute model
+        hidden_states = self.model(
+            input_ids=input_tokens_tensor,
+            positions=input_positions_tensor,
+            kv_caches=self.gpu_cache,
+            input_metadata=self.input_metadata,
+        )
+
+        # 4. Sample next tokens
+        next_tokens = self._sample(hidden_states, seq_group_metadata_list)
+
+        return [
+            SamplerOutput(
+                outputs=[next_tokens[seq_id] for seq_id in seq_group_metadata.seq_data.keys()],
+                sampled_token_ids=list(next_tokens.values()),
+            )
+            for seq_group_metadata in seq_group_metadata_list
+        ]
+
+    def _setup_caches(self, num_layers: int, num_heads: int, head_size: int,
+                     block_size: int, num_gpu_blocks: int):
+        """
+        Setup KV caches with paged attention.
+
+        Reference: vLLM's cache_engine.py
+        """
+        cache_shape = (num_gpu_blocks, block_size, num_heads, head_size)
+
+        gpu_cache = []
+        for _ in range(num_layers):
+            key_cache = torch.empty(cache_shape, dtype=torch.float16, device=self.device)
+            value_cache = torch.empty(cache_shape, dtype=torch.float16, device=self.device)
+            gpu_cache.append((key_cache, value_cache))
+
+        return gpu_cache
+
 ```
 
-Run this for different sequence lengths and observe the trend.
+**2.8.1 TensorRT-LLM Prefill Optimization**
 
-### 2.15 Checkpoint
+```python
+# TensorRT-LLM prefill optimization example
+# Based on: <https://github.com/NVIDIA/TensorRT-LLM>
 
-**Self-Assessment:**
-- [ ] I can explain why prefill is compute‑bound.
-- [ ] I can implement a basic attention mechanism.
-- [ ] I can describe the memory hierarchy and its impact on prefill.
-- [ ] I know what FlashAttention improves and by how much.
-- [ ] I can explain the tiling strategy used in FlashAttention.
-- [ ] I understand the difference between MHA, GQA, and MQA.
+def build_trtllm_engine(model_config, prefill_optimization=True):
+    """
+    Build TensorRT-LLM engine with prefill optimizations.
+    """
+    from tensorrt_llm import Builder
+    from tensorrt_llm.network import net_guard
 
----
+    builder = Builder()
+    builder_config = builder.create_builder_config(
+        precision='fp16',
+        timing_cache='model.cache',
+        tensor_parallel=model_config.tensor_parallel,
+        pipeline_parallel=model_config.pipeline_parallel,
+    )
 
-## Chapter 3: The Decode Phase – Memory‑Bound Iteration
+    # Enable prefill optimizations
+    if prefill_optimization:
+        # Use flash attention plugin
+        builder_config.plugin_config.gpt_attention_plugin = 'float16'
 
-### What You Will Build
+        # Enable paged KV cache for variable length
+        builder_config.plugin_config.paged_kv_cache = True
 
-You will implement a decode step that reads from a KV cache and produces the next token logits. You will measure its arithmetic intensity and see why it is memory‑bound.
+        # Set optimization profiles for different batch sizes
+        profiles = []
+        for batch_size in [1, 2, 4, 8, 16]:
+            profile = builder.create_optimization_profile()
+            profile.set_shape(
+                'input_ids',
+                min=(batch_size, 1),      # Minimum: decode
+                opt=(batch_size, 512),    # Optimal: medium prompt
+                max=(batch_size, 8192),   # Maximum: long prompt
+            )
+            profiles.append(profile)
 
-### 3.1 Context
+    # Build network
+    network = builder.create_network()
+    with net_guard(network):
+        # Network definition...
+        pass
 
-After the prompt is processed, the model enters the decode phase. It generates one token at a time, each requiring a full forward pass through the model. Because the KV cache holds the history, the model still attends to all previous tokens, but now the workload is dominated by moving data from memory to the compute units. This phase is **memory‑bound** [6].
+    # Build engine
+    engine = builder.build_engine(network, builder_config)
+    return engine
 
-### 3.2 Think First: Memory Access
+# Usage in inference
+class TRTLLMExecutor:
+    def prefill(self, prompt_tokens, max_output_len):
+        """
+        Execute prefill with TensorRT-LLM.
+        """
+        # Prepare inputs
+        input_lengths = torch.tensor([len(prompt_tokens)], dtype=torch.int32)
+        input_ids = torch.tensor([prompt_tokens], dtype=torch.int32)
 
-**Question:** In the decode step, you need to load the model weights and the entire KV cache. How many bytes are moved for a model with 7B parameters (FP16) and a KV cache of 1000 tokens (each token contributes key and value vectors of size $d_{\text{model}}$ per layer)? Assume 32 layers, hidden size 4096.
+        # Setup buffers
+        output_ids = torch.zeros((1, max_output_len), dtype=torch.int32)
+        sequence_lengths = torch.zeros((1,), dtype=torch.int32)
+        cum_log_probs = torch.zeros((1,), dtype=torch.float32)
 
-- Click to review
-    - Model weights: $7B \times 2$ bytes ≈ 14 GB.
-    - KV cache: As computed earlier, 512 MB. So total ≈ 14.5 GB moved per decode step. The computation performed is only a few GFLOPS, leading to an arithmetic intensity < 1. Hence memory‑bound.
+        # Execute
+        context = self.trt_context
+        buffers = [
+            input_ids, input_lengths, output_ids,
+            sequence_lengths, cum_log_probs,
+            self.kv_cache_block_pointers,
+            self.host_kv_cache_block_pointers,
+            self.host_context_lengths,
+        ]
 
-### 3.3 Decode Phase Data Flow Diagram
+        context.execute_v2(buffers)
 
-The following diagram from FlashInfer documentation illustrates the decode phase data flow:
+        return output_ids[0].tolist()
 
-```mermaid
-graph TD
-    subgraph "Decode Phase: Single Query Token"
-        Q["Query: [num_heads, head_dim]<br/>Single new token"]
-        K["Key Cache: [kv_len, num_heads, head_dim]<br/>All previous tokens"]
-        V["Value Cache: [kv_len, num_heads, head_dim]<br/>All previous tokens"]
-        Q --> Attn["Attention Computation"]
-        K --> Attn
-        V --> Attn
-        Attn --> Out["Output: [num_heads, head_dim]<br/>Single prediction vector"]
-        Out --> Append["Append to KV Cache"]
-    end
 ```
 
-**Diagram Explanation:** This diagram shows the data flow during the decode phase. Unlike prefill, the query is a single token with shape `[num_heads, head_dim]`. The key and value tensors are the accumulated KV cache from all previous tokens. Attention is computed between this single query and all cached keys/values. The output is a single vector used to predict the next token. This phase is memory-bound because it must read the entire KV cache for each token generated.
+## **3. The Decode Phase: Memory-Bound Iteration**
 
-### 3.3.1 Decode Kernel Architecture
+### **3.1 Mathematical Model of Decode**
 
-The following diagram illustrates FlashInfer's decode kernel architecture with pipelining:
+**Concept Intuition:**
+During decode, we are generating just *one* token.
+However, to generate this one token, we still need to pay attention to *everything* that came before it. This means we take our current single query ($q_t$) and check it against the entire history of Keys and Values ($K_{1:t}, V_{1:t}$).
+This is why the KV cache grows larger with every step, and why generating the 1000th token is slower/heavier than generating the 1st token.
 
-```mermaid
-graph TD
-    subgraph "Decode Kernel Pipeline"
-        Q["Load Query (single token)<br/>once into registers"]
-        Q --> Loop["Iterate through KV tiles"]
-        Loop --> Load["Load KV tile from HBM"]
-        Load --> Compute["Compute QK dot products<br/>for all tokens in tile"]
-        Compute --> Update["Update running softmax<br/>max, sum, partial output"]
-        Update --> Check{"More tiles?"}
-        Check -->|Yes| Loop
-        Check -->|No| Final["Finalize softmax normalization"]
-        Final --> Write["Write output"]
-    end
+For decode step t, we compute:
+
+```
+q_t = h_t W_Q
+Attention(q_t, K_{1:t}, V_{1:t}) = softmax(q_t K_{1:t}^T/√d_k) V_{1:t}
+
 ```
 
-**Diagram Explanation:** This diagram shows the pipelined architecture of FlashInfer's decode kernel. The query vector is loaded once into registers. Then the kernel iterates through KV cache tiles, loading each tile from HBM, computing QK dot products for all tokens in the tile, and updating the online softmax state. This pipelining overlaps computation with memory loads, hiding some latency, but the kernel remains memory-bound because the ratio of computation to memory access is low.
+The complexity is O(t × d_model) per step, or O(N²) total for N tokens.
 
-### 3.3.2 Memory Access Pattern Analysis
+### **3.2 Memory Access Pattern Analysis**
 
-The following diagram breaks down memory access and compute per decode step:
-
-```mermaid
-graph TD
-    subgraph "Memory Access per Decode Step"
-        Weights["Model Weights: 14 GB<br/>(loaded once per batch)"]
-        KVRead["KV Cache Read: 512 MB × t<br/>(grows with sequence length t)"]
-        KVWrite["New KV Write: 512 MB<br/>(one token)"]
-    end
-    subgraph "Compute per Decode Step"
-        FLOPS["Total FLOPs: ~14 GFLOPS<br/>(one forward pass)"]
-    end
-    subgraph "Arithmetic Intensity"
-        AI_calc["AI = 14 GFLOPS / 14.5 GB"]
-        AI_val["AI ≈ 0.97 FLOPs/byte"]
-    end
-    subgraph "Comparison"
-        Threshold["Threshold for compute-bound: ~100 FLOPs/byte"]
-        Conclusion["Decode is MEMORY-BOUND"]
-    end
-    Weights & KVRead & KVWrite --> AI_calc
-    FLOPS --> AI_calc
-    AI_calc --> AI_val
-    AI_val --> Compare["Compare"]
-    Threshold --> Compare
-    Compare --> Conclusion
-```
-
-**Diagram Explanation:** This diagram quantifies why decode is memory-bound. The left column shows bytes moved from HBM: model weights (loaded once per batch), KV cache read (grows with sequence length t), and new KV write. The middle column shows FLOPs performed. The resulting arithmetic intensity (FLOPs/byte) is typically 0.1-1, far below the 100+ needed to keep tensor cores busy. The GPU spends most time waiting for data movement.
-
-This low arithmetic intensity means the GPU is starved for data. The solution is to **batch** multiple decode requests together so that the weights are reused across sequences [6].
-
-### 3.4 KV Cache Evolution
-
-The cache grows linearly with each step, increasing the memory footprint and the amount of data that must be read.
+**Concept Intuition:**
+This is the most critical bottleneck in LLM inference.
+Imagine you have a massive library (the model weights, ~some GBs).
+To write just *one word*, you have to walk through every aisle of the library and look at every book. You do very little actual reading (computation), but you do a ton of walking (memory transfer).
+The diagram below compares the "walking" (HBM Access) vs the "reading" (Compute). The ratio called "Arithmetic Intensity" is very low, meaning the hardware spends most of its time waiting for data to arrive.
 
 ```mermaid
-graph LR
-    subgraph Step1
-        K1[K cache: 1 token] --> V1[V cache: 1 token]
-    end
-    subgraph Step2
-        K2[K cache: 2 tokens] --> V2[V cache: 2 tokens]
-    end
-    subgraph Step3
-        K3[K cache: 3 tokens] --> V3[V cache: 3 tokens]
-    end
-```
+flowchart TD
+    subgraph MemoryAccess["Memory Access per Decode Step"]
+        direction TB
 
-### 3.5 The Memory Fragmentation Problem
-
-Traditional systems allocate contiguous memory for each sequence’s KV cache. This leads to severe fragmentation [7]:
-
-```mermaid
-graph TD
-    subgraph Step1[Step 1: User 1 reserves 40GB slot]
-        M1[Memory: 0-40GB allocated for User 1]
-    end
-
-    subgraph Step2[Step 2: User 1 finishes, memory freed]
-        M2[Memory: Free but with 1GiB alignment boundaries]
-    end
-
-    subgraph Step3[Step 3: User 2 tries to allocate 40GB]
-        M3[Memory: No contiguous 40GB block available<br/>due to alignment metadata]
-        Result[Result: OOM error despite 80GB free]
-    end
-```
-
-This fragmentation limits concurrent users and wastes GPU memory [7].
-
-### 3.6 PagedAttention: Solving Fragmentation
-
-**PagedAttention**, introduced by Kwon et al. (2023) in the vLLM paper [7], divides the cache into fixed‑size blocks and maintains a logical-to-physical mapping.
-
-```mermaid
-flowchart LR
-    subgraph Logical[Logical sequence tokens]
-        T0[T0] --> T1[T1] --> T2[T2] --> T3[T3] --> T4[T4]
-    end
-    subgraph Physical[Physical memory blocks]
-        B0[Block 0] --> T0[T0] & T1[T1]
-        B1[Block 1] --> T2[T2] & T3[T3]
-        B2[Block 2] --> T4[T4]
-    end
-    Logical --> Mapping[Block Table] --> Physical
-```
-
-This allows non‑contiguous allocation, eliminates fragmentation, and enables sharing of common prefixes (e.g., system prompts) [7].
-
-### 3.6.1 PagedAttention Kernel Memory Access
-
-The following diagram from vLLM documentation illustrates how threads access PagedAttention memory:
-
-```mermaid
-graph TD
-    subgraph "Thread Group Memory Access"
-        TG["Thread Group (2 threads)"]
-        TG --> T0["Thread 0: handles even elements"]
-        TG --> T1["Thread 1: handles odd elements"]
-        
-        subgraph "Memory Layout"
-            QToken["Query Token"]
-            KToken["Key Token Block"]
+        subgraph HBM["HBM Access - Dominant Cost"]
+            W["Model Weights<br/>Size: 2×Params bytes"]
+            KVC["KV Cache Read<br/>Size: 2×t×L×H×D_h bytes"]
+            NewKV["KV Cache Write<br/>Size: 2×L×H×D_h bytes"]
         end
-        
-        T0 --> K0["K[0], K[2], K[4], ..."]
-        T1 --> K1["K[1], K[3], K[5], ..."]
-        
-        Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
+
+        subgraph Compute["Compute - Minimal"]
+            QKV["QKV Projection<br/>FLOPs: 6×B×d²"]
+            Attn["Attention<br/>FLOPs: 2×B×t×d"]
+            Proj["Output Projection<br/>FLOPs: 2×B×d²"]
+        end
+
+        subgraph ArithmeticIntensity["Arithmetic Intensity Calculation"]
+            TotalFLOPs["Total FLOPs: ~2N + 2tN/L"]
+            TotalBytes["Total Bytes: Model + KVCache"]
+            AI["AI = FLOPs / Bytes<br/>Typically 0.1-1 FLOP/Byte"]
+        end
     end
+
+    HBM --> Compute --> ArithmeticIntensity
+
+    subgraph Bottleneck["Bottleneck Analysis"]
+        BW["Memory Bandwidth: 1-2 TB/s"]
+        MaxFLOPs["Max FLOPs: BW × AI"]
+        Compare["Compare with Peak FLOPs<br/>If MaxFLOPs << PeakFLOPs: Memory Bound"]
+    end
+
+    ArithmeticIntensity --> Bottleneck
+
 ```
 
-**Diagram Explanation:** This diagram shows how thread groups access memory in the PagedAttention kernel. Each thread group (2 threads in this example) handles one query token and one key token. Each thread processes a subset of elements (every other element) so that neighboring threads read neighboring memory addresses, achieving memory coalescing for better bandwidth utilization.
+*Diagram 3.1: Memory Access Pattern Analysis.*
 
-Key concepts from the vLLM implementation [8]:
+**Detailed Explanation for Researchers:**
+This diagram provides the mathematical justification for why Batch size > 1 is strictly necessary during decode.
+*   **The Problem (AI < 1):** Arithmetic Intensity (AI) is the ratio of "Math Ops" to "Bytes Moved". In a naive loop (Batch Size=1), we load the entire model ($2N$ bytes, e.g., 140GB for Llama-70B) just to perform a tiny matrix-vector multiplication. The AI is effectively $\approx 1$, which is atrociously low compared to the GPU's capability (A100 peak AI is >100).
+*   **The Bandwidth Wall:** Modern GPUs (like H100) have ~3TB/s bandwidth but ~1000 TFLOPS compute. If your algorithm's AI is low, you hit the "Bandwidth Wall" and the Compute units sit idle 99% of the time.
+*   **The Solution:** By increasing batch size (e.g., to 128), we load the weights *once* and apply them to 128 tokens. This increases the operational intensity by 128x, moving us from the "Memory Bound" region towards the "Compute Bound" region.
+*   **KV Cache Cost:** Note that while weights are reused, KV Cache is *unique* per sequence. This introduces a secondary bandwidth wall that grows with sequence length ($t$).
 
-- **Block:** Fixed-size unit of KV cache (e.g., 16 tokens per block)
-- **Thread group:** Group of threads that fetch and calculate one query token together
-- **Warp:** 32 threads that process one entire block of key tokens
-- **Vector size:** Chosen so each thread group fetches 16 bytes at a time for coalesced memory access
+### **3.3 KV Cache Evolution During Decode**
 
-### 3.7 Implementation: Decode Step with KV Cache
+```mermaid
+flowchart TD
+    subgraph CacheEvolution["KV Cache Evolution"]
+        direction LR
 
-Complete the following decode step. Assume you have a KV cache stored as a list of `(k_cache, v_cache)` for each layer.
+        T0["Step 0<br/>Prompt: S tokens"]
+        T1["Step 1<br/>S+1 tokens"]
+        T2["Step 2<br/>S+2 tokens"]
+        TN["Step N<br/>S+N tokens"]
+
+        T0 --> T1 --> T2 --> TN
+
+        subgraph Layout["Memory Layout"]
+            Cont["Contiguous<br/>Simple but inflexible"]
+            Paged["Paged<br/>Flexible with overhead"]
+            Block["Blocked<br/>Balance of both"]
+        end
+
+        TN --> Layout
+    end
+
+    subgraph Operations["Cache Operations per Step"]
+        Read["Read K[0:t], V[0:t]<br/>Size: 2×t×L×H×D_h"]
+        Write["Write K[t], V[t]<br/>Size: 2×L×H×D_h"]
+        Total["Total: O(t) growth"]
+    end
+
+    CacheEvolution --> Operations
+
+    subgraph Optimization["Optimization Strategies"]
+        FP8["FP8 Quantization<br/>2× reduction"]
+        Selective["Selective Caching<br/>Cache only important layers"]
+        Compression["Cache Compression<br/>Lossy/lossless"]
+    end
+
+    Operations --> Optimization
+
+```
+
+*Diagram 3.2: KV Cache Evolution.* This diagram shows how the KV cache grows during decode and the associated operations.
+
+### **3.4 PagedAttention Memory Management**
+
+```mermaid
+flowchart TD
+    subgraph PagedAttention["PagedAttention System"]
+        direction TB
+
+        subgraph Logical["Logical View"]
+            Seq1["Sequence 1<br/>Tokens: 0..T1"]
+            Seq2["Sequence 2<br/>Tokens: 0..T2"]
+            Seq3["Sequence 3<br/>Tokens: 0..T3"]
+        end
+
+        subgraph Physical["Physical Memory Blocks"]
+            Block0["Block 0<br/>Size: B tokens"]
+            Block1["Block 1"]
+            Block2["Block 2"]
+            BlockN["Block N"]
+        end
+
+        subgraph Mapping["Block Mapping Table"]
+            T1Map["Seq1: Block0, Block1, Block3"]
+            T2Map["Seq2: Block2, Block4"]
+            T3Map["Seq3: Block5"]
+        end
+
+        Logical --> Mapping --> Physical
+
+        subgraph Operations["Key Operations"]
+            Alloc["Allocate Block<br/>When current block full"]
+            Free["Free Blocks<br/>When sequence completes"]
+            Defrag["Defragment<br/>Optional compaction"]
+        end
+
+        Physical --> Operations
+    end
+
+    subgraph Benefits["Benefits"]
+        Frag["Eliminates Fragmentation"]
+        Share["Enables Sharing<br/>Prefix sharing across sequences"]
+        Dynamic["Dynamic Allocation"]
+    end
+
+    PagedAttention --> Benefits
+
+    subgraph Overhead["Overhead"]
+        Table["Mapping Table Overhead"]
+        Indirect["Indirect Access Cost"]
+        Complex["Increased Complexity"]
+    end
+
+    PagedAttention --> Overhead
+
+```
+
+*Diagram 3.3: PagedAttention Memory Management.*
+
+**Detailed Explanation for Researchers:**
+PagedAttention is the defining feature of vLLM, solving the "Memory Fragmentation" problem that plagued early systems (like FasterTransformer).
+*   **The Problem (Contiguous Memory):** Early systems pre-allocated contiguous VRAM for the maximum possible sequence length (e.g., 2048 tokens). If a user stopped after 50 tokens, 1998 slots were wasted ("Internal Fragmentation"). If the system couldn't find a contiguous block big enough, the request failed ("External Fragmentation").
+*   **The OS Inspiration:** Just as Virtual Memory allows an OS to store a continuous program in scattered physical RAM pages, PagedAttention stores a continuous logical conversation in scattered VRAM blocks.
+*   **Block Table:** The "Mapping" section in the diagram is a lookup table (similar to a Page Table) that translates `(RequestID, LogicalTokenIndex)` -> `(PhysicalBlockID, Offset)`.
+*   **Copy-on-Write (Prefix Sharing):** A secondary benefit (not fully shown but implied by the "Share" node) is efficient beam search or system prompt handling. If two requests start with the same system prompt, they can point to the same physical blocks for those initial tokens, saving GBs of VRAM.
+
+### **3.5 Decode Kernel Fusion Strategies**
+
+```mermaid
+flowchart TD
+    subgraph KernelFusion["Kernel Fusion for Decode"]
+        direction TB
+
+        subgraph Baseline["Baseline - Separate Kernels"]
+            K1["Embedding"]
+            K2["QKV Projection"]
+            K3["Attention"]
+            K4["Output Projection"]
+            K5["FFN Layer 1"]
+            K6["FFN Layer 2"]
+            K7["LayerNorm"]
+        end
+
+        subgraph Fused["Fused Strategy"]
+            F1["Fused QKV + Attention"]
+            F2["Fused FFN Layers"]
+            F3["Fused LayerNorm with residual"]
+        end
+
+        Baseline --> Fused
+
+        subgraph Benefits["Fusion Benefits"]
+            Mem["Reduced Memory Traffic"]
+            Launch["Fewer Kernel Launches"]
+            Reg["Better Register Reuse"]
+        end
+
+        Fused --> Benefits
+
+        subgraph Challenges["Fusion Challenges"]
+            Register["Register Pressure"]
+            Complexity["Increased Code Complexity"]
+            Maintenance["Harder to Maintain"]
+        end
+
+        Fused --> Challenges
+    end
+
+    subgraph RealExample["Real-World Example: xFormers"]
+        MemoryEfficient["Memory Efficient Attention"]
+        FlashDecode["Flash-Decode for long contexts"]
+        BlockSparse["Block-Sparse Attention"]
+    end
+
+    KernelFusion --> RealExample
+
+```
+
+*Diagram 3.4: Decode Kernel Fusion.*
+
+**Detailed Explanation for Researchers:**
+In memory-bound applications like LLM decoding, "Kernel Fusion" is not just an optimization; it is a necessity for reasonable latency.
+*   **The Problem:** Every time a kernel (GPU function) finishes, it writes its result to HBM. The next kernel reads it back. For an operation like `x = x + a; y = x * b`, running two kernels means writing `x` to memory and reading it back, wasting bandwidth.
+*   **The Solution:** Kernel Fusion combines multiple mathematical operations into a single CUDA kernel. The intermediate values stay in the fast Registry/SRAM and are never written to global memory.
+*   **Key Fusions in LLMs:**
+    *   **QKV + Rotary Embedding:** Instead of calculating Q, K, V separately and then applying rotations, we do it all in one go.
+    *   **LayerNorm + Residual:** Standard PyTorch implements these as two calls; fused kernels do them together.
+    *   **Flash-Decoding:** This is the ultimate fusion for the Attention block itself, dealing with the difficulty of parallelizing the softmax operation across thread blocks.
+
+### **3.6 Implementation: Optimized Decode Phase**
+
+**Code Explanation for Researchers:**
+This snippet represents the "Naive" baseline. It clearly demonstrates the limitation: the loop runs in Python, and for every single token, we invoke the full weight matrix of the model.
+Notice the `kv_cache` argument. In a naive implementation, this grows linearly. In an optimized one (like vLLM), this would be replaced by a `BlockTable` pointer.
+
+**3.6.1 Basic Decode Step Implementation**
 
 ```python
-def decode_step(input_token, position, kv_cache, model):
-    # input_token: [batch, 1] token IDs
-    # position: current position (int)
-    # kv_cache: list of (k_cache, v_cache) for each layer
-    # model: transformer model
+# Basic decode step implementation
+def decode_step_basic(
+    input_token: torch.Tensor,
+    position: int,
+    kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    model: nn.Module,
+) -> torch.Tensor:
+    """
+    Basic decode step showing the iterative nature.
 
-    hidden = model.embedding(input_token)                # [batch, 1, d]
-    pos_emb = model.position_embedding(position)         # [1, d]
-    hidden = hidden + pos_emb.unsqueeze(0)
+    Args:
+        input_token: [batch_size, 1] token ID
+        position: Current position in sequence
+        kv_cache: List of (K_cache, V_cache) for each layer
+        model: Transformer model
 
-    for layer_idx, layer in enumerate(model.layers):
+    Returns:
+        Next token logits
+    """
+    batch_size = input_token.shape[0]
+
+    # 1. Embed the token
+    hidden_states = model.embedding(input_token)  # [B, 1, D]
+
+    # 2. Position embedding
+    pos_emb = model.position_embedding(position)
+    hidden_states = hidden_states + pos_emb
+
+    # 3. Process through each layer
+    for layer_idx, block in enumerate(model.layers):
+        # Get cached K, V for this layer
         k_cache, v_cache = kv_cache[layer_idx]
 
         # Compute Q, K, V for current token
-        q, k, v = layer.attention.qkv_proj(hidden)       # Q1: What are shapes?
+        q, k, v = block.attention.qkv_proj(hidden_states)
 
         # Update cache
         if k_cache is None:
             k_cache = k
             v_cache = v
         else:
-            k_cache = torch.cat([k_cache, k], dim=1)    # Q2: Which dimension?
+            k_cache = torch.cat([k_cache, k], dim=1)
             v_cache = torch.cat([v_cache, v], dim=1)
+
         kv_cache[layer_idx] = (k_cache, v_cache)
 
-        # Attention using full cache
-        attn_out = layer.attention(q, k_cache, v_cache)
-        hidden = layer.ffn(layer.norm1(hidden + attn_out))
-        hidden = layer.norm2(hidden)
+        # Compute attention using entire cache
+        attn_output = block.attention(
+            q, k_cache, v_cache,
+            is_causal=True,
+            attention_mask=None,
+        )
 
-    logits = model.lm_head(hidden[:, -1, :])
-    return logits, kv_cache
+        # Rest of transformer block
+        hidden_states = block.feed_forward(
+            block.norm1(hidden_states + attn_output)
+        )
+        hidden_states = block.norm2(hidden_states)
+
+    # 4. Final projection
+    logits = model.lm_head(hidden_states[:, -1, :])
+    return logits
+
 ```
 
-- Click for solutions
-    
-    **Q1:** `q, k, v` each have shape `[batch, 1, num_heads, head_dim]`.
-    
-    **Q2:** Concatenate along the sequence dimension (`dim=1`), because the new token extends the sequence.
-    
+**3.6.2 vLLM's Decode Implementation with PagedAttention**
 
-### 3.8 Speculative Decoding: Breaking Sequentiality
+```python
+# Based on vLLM's decode implementation
+# Reference: <https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention.py>
 
-Speculative decoding [9] uses a smaller draft model to propose multiple tokens, which are then verified in parallel by the target model. This can reduce latency by 2-3×.
+class PagedAttentionDecoder:
+    """Decode with PagedAttention."""
+
+    def forward_decode(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        num_kv_heads: int,
+        scale: float,
+        alibi_slopes: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Forward pass for decode phase with paged KV cache.
+
+        Args:
+            query: [num_tokens, num_heads, head_size]
+            key_cache: [num_blocks, block_size, num_kv_heads, head_size]
+            value_cache: [num_blocks, block_size, num_kv_heads, head_size]
+            block_tables: [num_seqs, max_num_blocks_per_seq]
+            context_lens: [num_seqs]
+            num_kv_heads: Number of key/value heads
+            scale: Scaling factor for attention
+            alibi_slopes: ALiBi slopes for positional encoding
+        """
+        num_tokens = query.shape[0]
+        num_heads = query.shape[1]
+        head_size = query.shape[2]
+        max_num_blocks_per_seq = block_tables.shape[1]
+
+        # Reshape query for attention
+        output = torch.empty_like(query)
+
+        # Call custom CUDA kernel
+        if _paged_attention_v2 is not None and query.is_cuda:
+            # vLLM's optimized paged attention kernel
+            _paged_attention_v2(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                scale,
+                block_tables,
+                context_lens,
+                block_size=self.block_size,
+                max_num_blocks_per_seq=max_num_blocks_per_seq,
+                alibi_slopes=alibi_slopes,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+        else:
+            # Fallback implementation
+            output = self._paged_attention_fallback(
+                query, key_cache, value_cache,
+                block_tables, context_lens,
+                num_kv_heads, scale,
+            )
+
+        return output
+
+    def _paged_attention_fallback(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        num_kv_heads: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """
+        Fallback CPU implementation for educational purposes.
+        """
+        num_seqs = query.shape[0]
+        num_heads = query.shape[1]
+        head_size = query.shape[2]
+        output = torch.zeros_like(query)
+
+        for seq_idx in range(num_seqs):
+            seq_len = context_lens[seq_idx].item()
+            block_table = block_tables[seq_idx]
+
+            # Gather KV cache for this sequence
+            if self.block_size <= 0:
+                raise ValueError(f"block_size must be positive, got {self.block_size}")
+            kv_blocks_needed = (seq_len + self.block_size - 1) // self.block_size
+
+            # Prepare to gather all K, V for this sequence
+            k_list = []
+            v_list = []
+
+            for block_idx in range(kv_blocks_needed):
+                block_id = block_table[block_idx].item()
+                block_start = block_idx * self.block_size
+                block_end = min(block_start + self.block_size, seq_len)
+                tokens_in_block = block_end - block_start
+
+                # Get block from cache
+                k_block = key_cache[block_id, :tokens_in_block]
+                v_block = value_cache[block_id, :tokens_in_block]
+
+                k_list.append(k_block)
+                v_list.append(v_block)
+
+            # Concatenate all blocks for this sequence
+            k_seq = torch.cat(k_list, dim=0)  # [seq_len, num_kv_heads, head_size]
+            v_seq = torch.cat(v_list, dim=0)  # [seq_len, num_kv_heads, head_size]
+
+            # Compute attention for each head
+            for head_idx in range(num_heads):
+                kv_head_idx = head_idx % num_kv_heads
+
+                q = query[seq_idx, head_idx]  # [head_size]
+                k = k_seq[:, kv_head_idx]     # [seq_len, head_size]
+                v = v_seq[:, kv_head_idx]     # [seq_len, head_size]
+
+                # Compute attention scores
+                scores = torch.matmul(k, q) * scale  # [seq_len]
+
+                # Apply causal mask
+                scores = scores[:seq_len]
+
+                # Softmax
+                probs = F.softmax(scores, dim=0)
+
+                # Weighted sum of values
+                attn_output = torch.sum(v[:seq_len] * probs.unsqueeze(-1), dim=0)
+
+                output[seq_idx, head_idx] = attn_output
+
+        return output
+
+```
+
+**3.6.3 TensorRT-LLM Decode Implementation**
+
+```python
+# TensorRT-LLM decode implementation
+# Based on: <https://github.com/NVIDIA/TensorRT-LLM>
+
+class TRTLLMDecoder:
+    """TensorRT-LLM optimized decoder."""
+
+    def decode_step(
+        self,
+        input_ids: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        past_key_value_lengths: torch.Tensor,
+        cache_indirection: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Execute a decode step with TensorRT-LLM.
+
+        Args:
+            input_ids: [batch_size, beam_width]
+            sequence_lengths: [batch_size]
+            past_key_value_lengths: [batch_size, 2, num_layers]
+            cache_indirection: [batch_size, beam_width, max_seq_len]
+        """
+        batch_size = input_ids.shape[0]
+        beam_width = input_ids.shape[1]
+
+        # Prepare buffers
+        context_lengths = sequence_lengths.clone()
+        host_context_lengths = context_lengths.cpu()
+
+        # Setup KV cache pointers
+        kv_cache_block_pointers = self._get_kv_cache_pointers(
+            batch_size, beam_width, past_key_value_lengths
+        )
+
+        # TensorRT execution
+        bindings = [
+            input_ids.data_ptr(),
+            context_lengths.data_ptr(),
+            self.output_ids.data_ptr(),
+            self.sequence_lengths.data_ptr(),
+            self.cum_log_probs.data_ptr(),
+            self.log_probs.data_ptr(),
+            self.finished.data_ptr(),
+            kv_cache_block_pointers.data_ptr(),
+            cache_indirection.data_ptr(),
+            host_context_lengths.data_ptr(),
+        ]
+
+        # Execute context (prefill) or generation (decode) phase
+        if self.is_context_phase:
+            self.context.execute_v2(bindings)
+            self.is_context_phase = False
+        else:
+            self.generation.execute_v2(bindings)
+
+        # Update sequence lengths
+        sequence_lengths += 1
+
+        return self.output_ids
+
+    def _get_kv_cache_pointers(
+        self,
+        batch_size: int,
+        beam_width: int,
+        past_key_value_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get KV cache pointers for paged attention.
+
+        This implements the pointer structure for:
+        - Layer-wise cache partitioning
+        - Beam search support
+        - Variable sequence lengths
+        """
+        num_layers = self.model_config.num_layers
+        num_heads = self.model_config.num_heads
+        head_size = self.model_config.head_size
+
+        # Calculate pointers based on cache layout
+        pointers = torch.zeros(
+            (batch_size, beam_width, 2, num_layers),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        for batch_idx in range(batch_size):
+            for beam_idx in range(beam_width):
+                seq_len = past_key_value_lengths[batch_idx, beam_idx, 0]
+
+                # Calculate block indices
+                block_idx = seq_len // self.block_size
+                block_offset = seq_len % self.block_size
+
+                for layer_idx in range(num_layers):
+                    # Key cache pointer
+                    key_ptr = (
+                        layer_idx * self.blocks_per_layer * self.block_size *
+                        num_heads * head_size +
+                        block_idx * self.block_size * num_heads * head_size +
+                        block_offset * num_heads * head_size
+                    )
+
+                    # Value cache pointer (stored separately)
+                    value_ptr = (
+                        (self.num_layers + layer_idx) * self.blocks_per_layer *
+                        self.block_size * num_heads * head_size +
+                        block_idx * self.block_size * num_heads * head_size +
+                        block_offset * num_heads * head_size
+                    )
+
+                    pointers[batch_idx, beam_idx, 0, layer_idx] = key_ptr
+                    pointers[batch_idx, beam_idx, 1, layer_idx] = value_ptr
+
+        return pointers
+
+```
+
+**3.6.4 Flash-Decode for Long Contexts**
+
+```python
+# Flash-Decode implementation concept
+# Based on: <https://arxiv.org/abs/2307.08691>
+
+class FlashDecodeAttention:
+    """
+    Flash-Decode: Efficient attention for long contexts during decode.
+
+    Key insight: During decode, we compute attention between:
+    - 1 query token (current position)
+    - Many key tokens (entire context)
+
+    This can be optimized by:
+    1. Loading keys in chunks
+    2. Computing partial attention per chunk
+    3. Maintaining running statistics
+    """
+
+    def forward(
+        self,
+        query: torch.Tensor,      # [batch, num_heads, head_dim]
+        key: torch.Tensor,        # [batch, num_heads, seq_len, head_dim]
+        value: torch.Tensor,      # [batch, num_heads, seq_len, head_dim]
+        block_size: int = 256,
+    ) -> torch.Tensor:
+        """
+        Flash-Decode attention forward pass.
+        """
+        batch_size, num_heads, head_dim = query.shape
+        seq_len = key.shape[2]
+
+        output = torch.zeros_like(query)
+        max_logits = torch.full((batch_size, num_heads), float('-inf'), device=query.device)
+        exp_sums = torch.zeros((batch_size, num_heads), device=query.device)
+
+        # Process key/value in chunks
+        for chunk_start in range(0, seq_len, block_size):
+            chunk_end = min(chunk_start + block_size, seq_len)
+
+            # Load chunk
+            key_chunk = key[:, :, chunk_start:chunk_end, :]  # [B, H, chunk_size, D]
+            value_chunk = value[:, :, chunk_start:chunk_end, :]
+
+            # Compute attention scores for this chunk
+            # query: [B, H, D], key_chunk: [B, H, chunk_size, D]
+            scores = torch.einsum('bhd,bhcd->bhc', query, key_chunk) / math.sqrt(head_dim)
+
+            # Update running statistics
+            chunk_max = scores.max(dim=-1, keepdim=True).values  # [B, H, 1]
+
+            # Compute exponentials
+            exp_scores = torch.exp(scores - chunk_max)
+
+            # Update output
+            # output += exp_scores @ value_chunk
+            weighted_values = torch.einsum('bhc,bhcd->bhd', exp_scores, value_chunk)
+            output = output * torch.exp(max_logits.unsqueeze(-1) - chunk_max.squeeze(-1).unsqueeze(-1))
+            output += weighted_values
+
+            # Update statistics
+            max_logits = torch.maximum(max_logits, chunk_max.squeeze(-1))
+            exp_sums = exp_sums * torch.exp(max_logits - chunk_max.squeeze(-1)) + exp_scores.sum(dim=-1)
+
+        # Normalize
+        output = output / exp_sums.unsqueeze(-1)
+
+        return output
+
+```
+
+## **4. The Scheduler's Challenge: Batching Heterogeneous Work**
+
+### **4.1 Mathematical Formulation of Scheduling Problem**
+
+**Concept Intuition:**
+The scheduler is the traffic controller. It has a lineup of cars (requests) of different lengths (prompt size) and different destinations (output length).
+Its job is to pack as many cars onto the highway (the GPU) as possible without causing a crash (OOM) or a traffic jam (high latency).
+The core tension is that "Prefill" cars are huge semi-trucks that block the road, while "Decode" cars are small motorbikes that zip by but require constant attention.
+
+Let:
+
+- R = set of requests
+- For request r: p_r = prompt length, g_r = generated tokens so far
+- B = batch capacity (max tokens)
+- Objective: Maximize throughput while respecting latency constraints
+
+### **4.2 Scheduling Algorithm Space**
+
+**Concept Intuition:**
+We have evolved three ways to manage this traffic:
+1.  **Static:** Wait for a bus to fill up before leaving. (Bad latency for first passenger).
+2.  **Dynamic:** Send small vans as soon as they have a few people. (Better).
+3.  **Continuous:** Allow new passengers to jump onto a moving train at any stop. (Best, used in vLLM).
 
 ```mermaid
-graph LR
-    subgraph Speculative[Speculative Decoding]
-        A[Input token] --> B[Draft model generates K candidates]
-        B --> C[Target model verifies all in parallel]
-        C --> D[Accept longest prefix]
-        D --> E[Next input token]
+flowchart TD
+    subgraph SchedulingSpace["Scheduling Algorithm Space"]
+        direction TB
+
+        subgraph Static["Static Batching"]
+            Fixed["Fixed Batch Size"]
+            Fill["Fill Until Full"]
+            Wait["Wait for Timeout"]
+        end
+
+        subgraph Dynamic["Dynamic Batching"]
+            OR["Or-Recursive Batching"]
+            Adaptive["Adaptive Batching"]
+            LookAhead["Look-Ahead Scheduling"]
+        end
+
+        subgraph Continuous["Continuous Batching"]
+            Iter["Iteration-Level"]
+            Chunk["Chunk-Aware"]
+            Priority["Priority-Based"]
+        end
+
+        Static --> Dynamic --> Continuous
     end
+
+    subgraph Metrics["Scheduling Metrics"]
+        Tput["Throughput<br/>Tokens/sec/GPU"]
+        TTFT["Time-To-First-Token"]
+        TPOT["Time-Per-Output-Token"]
+        Fair["Fairness<br/>Jain's Index"]
+    end
+
+    SchedulingSpace --> Metrics
+
+    subgraph Algorithms["Specific Algorithms"]
+        vLLM["vLLM Scheduler"]
+        TGI["TGI Continuous Batching"]
+        MII["MII Dynamic Batching"]
+    end
+
+    Continuous --> Algorithms
+
 ```
 
-**Implementation note:** This technique is especially effective when the draft model is much smaller and the acceptance rate is high.
+*Diagram 4.1: Scheduling Algorithm Space.* This diagram categorizes scheduling algorithms and shows their evolution.
 
-### 3.9 Test and Verify
-
-**Predict:** If you run decode for 100 steps, how does the time per step change? Why?
-
-- Click to verify
-    
-    The time per step increases slightly because the KV cache grows, so more data must be read from memory each time. However, the increase is sublinear because the attention computation is $O(t \cdot d)$ and memory movement is $O(t \cdot d)$ as well. The dominating factor is still the model weights, so the increase may be modest.
-    
-
-### 3.10 Checkpoint
-
-**Self-Assessment:**
-- [ ] I can explain why decode is memory‑bound.
-- [ ] I can implement a decode step with a KV cache.
-- [ ] I understand how PagedAttention reduces fragmentation.
-- [ ] I can calculate arithmetic intensity for a given configuration.
-- [ ] I can explain the memory fragmentation problem with an example.
-- [ ] I understand the basic idea of speculative decoding.
-
----
-
-## Chapter 4: The Scheduler’s Challenge – Batching Heterogeneous Work
-
-### What You Will Build
-
-You will simulate a simple scheduler that batches requests and observe the trade‑offs between static, dynamic, and continuous batching.
-
-### 4.1 Context
-
-A production server handles many requests simultaneously. Some are in prefill (processing a new prompt), others are in decode (generating the next token). The scheduler must decide which requests to run in each iteration to maximize throughput while meeting latency SLOs [10].
-
-### 4.2 Think First: Batching
-
-**Question:** Why can’t we simply run all waiting requests together in one giant batch?
-
-- Click to review
-    - Different requests are at different phases (prefill vs decode) and have different lengths. Mixing them naively would waste computation (e.g., padding short sequences) or cause high latency (a long prefill blocking many decodes).
-    - The total number of tokens that can be processed in one iteration is limited by GPU memory and compute capacity.
-
-### 4.3 Scheduling Algorithms
-
-```mermaid
-flowchart LR
-    subgraph Static[Static Batching]
-        Fill[Fill batch, then run]
-        Wait[Wait for timeout or full]
-    end
-    subgraph Dynamic[Dynamic Batching]
-        OR[Or‑recursive batching]
-        Adaptive[Adaptive batch size]
-    end
-    subgraph Continuous[Continuous Batching]
-        Iter[Iteration‑level scheduling]
-        Chunk[Chunk‑aware prefill]
-    end
-    Static --> Dynamic --> Continuous
-```
-
-**Continuous batching** (used in vLLM, TGI) adds new requests to the batch at every iteration, allowing prefill chunks to interleave with decode steps [10].
-
-### 4.4 Performance Impact of Continuous Batching
-
-Studies show significant improvements with continuous batching [7,10]:
-
-```mermaid
-graph LR
-    subgraph Throughput[Throughput Improvement]
-        T1[Traditional: baseline]
-        T2[vLLM: +30%]
-        T3[TGI: +40%]
-    end
-
-    subgraph Utilization[GPU Utilization]
-        U1[Traditional: 60-70%]
-        U2[Continuous: 90-95%]
-    end
-```
-
-### 4.5 Continuous Batching State Machine
+### **4.3 Continuous Batching State Machine**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting : Request arrives
-    Waiting --> Prefill : scheduled
-    Prefill --> Decoding : first token generated
-    Decoding --> Decoding : next token
-    Decoding --> Finished : generation complete
-    Finished --> [*] : free resources
-    Decoding --> Paused : preempted (memory pressure)
-    Paused --> Decoding : resumed
+    [*] --> Waiting : Request Arrives
+    Waiting --> Prefill : Scheduled
+    Prefill --> Decoding : First Token Generated
+    Decoding --> Decoding : Generate Next Token
+    Decoding --> Finished : Generation Complete
+    Finished --> [*] : Resources Freed
+
+    state Prefill {
+        [*] --> Chunking : Long Prompt
+        Chunking --> Processing : Process Chunk
+        Processing --> Chunking : More Chunks
+        Processing --> [*] : All Chunks Done
+    }
+
+    state Decoding {
+        [*] --> Active : In Batch
+        Active --> Paused : Preempted
+        Paused --> Active : Rescheduled
+        Active --> [*] : Complete
+    }
+
+    note right of Waiting
+        Queue Position based on:
+        - Priority
+        - Request Time
+        - Prompt Length
+    end note
+
 ```
 
-The scheduler may pause a low‑priority decode request and swap its KV cache to CPU if GPU memory is tight [7].
+*Diagram 4.2: Continuous Batching State Machine.*
 
-### 4.6 Prefill-Decode Imbalance
+**Detailed Explanation for Researchers:**
+This diagram maps the lifecycle of a request in a system like vLLM or Orca.
+*   **The Paradigm Shift:** In traditional batching, a request is either "waiting" or "running". In Continuous Batching, the "running" state is fluid. A request can participate in the batch for one token generation step, be paused (swapped out to CPU RAM) if VRAM is tight, and then return.
+*   **The "Chunking" Sub-state:** Notice the `Prefill` state has a `Chunking` loop. This is critical for preventing "Head-of-Line Blocking". If a massive prompt arrives, we don't block the `Decoding` loop for 500ms. We process 50ms of the prompt, then let the `Decoding` requests run one step, then process another 50ms.
+*   **Preemption:** The `Decoding -> Paused` transition is the safety valve. If the KV Cache grows too large (because all sequences generated long outputs), the scheduler actively evicts the lowest priority request to CPU RAM to prevent an OOM crash for the others.
 
-Long prompts create imbalance [11]:
+### **4.4 Memory Management in Scheduling**
+
+```mermaid
+flowchart TD
+    subgraph MemoryMgmt["Memory Management in Scheduler"]
+        direction TB
+
+        subgraph Allocation["Allocation Strategy"]
+            FirstFit["First Fit"]
+            BestFit["Best Fit"]
+            Buddy["Buddy System"]
+            Slab["Slab Allocation"]
+        end
+
+        subgraph CacheMgmt["Cache Management"]
+            LRU["LRU Eviction"]
+            LFU["LFU Eviction"]
+            ARC["Adaptive Replacement"]
+            WorkingSet["Working Set Model"]
+        end
+
+        subgraph Sharing["Sharing Optimization"]
+            Prefix["Prompt Prefix Sharing"]
+            Layer["Layer-wise Sharing"]
+            Head["Attention Head Sharing"]
+        end
+
+        Allocation --> CacheMgmt --> Sharing
+
+        subgraph Policies["Management Policies"]
+            Watermark["High/Low Watermark"]
+            Prefetch["Prefetching"]
+            Compression["On-demand Compression"]
+        end
+
+        Sharing --> Policies
+    end
+
+    subgraph Challenges["Memory Challenges"]
+        Frag["Fragmentation"]
+        Thrash["Thrashing"]
+        Overhead["Management Overhead"]
+    end
+
+    MemoryMgmt --> Challenges
+
+    subgraph Solutions["Common Solutions"]
+        Paged["Paged Attention"]
+        Virtual["Virtual Memory"]
+        Tiered["Tiered Storage"]
+    end
+
+    Challenges --> Solutions
+
+```
+
+*Diagram 4.3: Memory Management in Scheduling.* This diagram shows memory management strategies within the scheduler.
+
+### **4.5 Scheduler Performance Trade-offs**
 
 ```mermaid
 graph TD
-    subgraph WithoutChunking[Without Chunked Prefill]
-        T0[Time 0ms] --> P[32K token prefill: 2-8 seconds]
-        P --> D1[Decode user 1: token 1]
-        D1 --> D2[Decode user 1: token 2]
-        Note[200 decode users starved during prefill]
+    subgraph Tradeoffs["Scheduler Performance Trade-offs"]
+        A["Small Batch Size"] --> B["Low Latency"]
+        A --> C["Low Utilization"]
+
+        D["Large Batch Size"] --> E["High Throughput"]
+        D --> F["High Latency"]
+
+        G["Decode-First"] --> H["Good TPOT"]
+        G --> I["Poor TTFT"]
+
+        J["Prefill-First"] --> K["Good TTFT"]
+        J --> L["Poor TPOT"]
+
+        M["Fixed Chunk Size"] --> N["Predictable"]
+        M --> O["Inefficient for Varied Lengths"]
+
+        P["Dynamic Chunking"] --> Q["Efficient"]
+        P --> R["Complex"]
     end
 
-    subgraph WithChunking[With Chunked Prefill]
-        C1[Prefill chunk 1: 512 tokens] --> D1[Decode all users: 1 step]
-        D1 --> C2[Prefill chunk 2: 512 tokens]
-        C2 --> D2[Decode all users: 1 step]
-        Note2[Decode users get tokens every iteration]
+    subgraph Optimal["Optimal Point"]
+        S["Balance All Metrics"]
+        T["Adapt to Workload"]
+        U["Dynamic Adjustment"]
     end
+
+    B & E & H & K & N & Q --> S
+
 ```
 
-### 4.7 Implementation: Simple Continuous Batching Simulator
+*Diagram 4.4: Scheduler Performance Trade-offs.* This diagram visualizes the trade-offs between different scheduling decisions.
 
-Write a simulator that maintains a list of active requests, each with a `state` (prefill or decode) and `remaining_tokens`. At each iteration, the scheduler selects a set of requests to run up to a token budget.
+### **4.6 Implementation: Advanced Scheduling Systems**
+
+**Code Explanation for Researchers:**
+This pseudocode distills the logic of the actual vLLM scheduler.
+*   **Separation of Concerns:** Notice `BlockSpaceManager` vs `Policy`. The manager handles the *mechanism* (can I fit this?), while the policy handles the *strategy* (should I pick this?).
+*   **The Main Loop:** The `schedule()` method is called *every iteration*. It doesn't plan far ahead; it reacts to the current state of the memory pool. This "Just-In-Time" scheduling is key to handling the unpredictable output lengths of LLMs.
+
+**4.6.1 vLLM Scheduler Implementation**
 
 ```python
-class Request:
-    def __init__(self, prompt_len, output_len):
-        self.prompt_len = prompt_len
-        self.output_len = output_len
-        self.generated = 0
-        self.state = 'prefill'   # or 'decode'
-        self.done = False
+# Based on vLLM's scheduler implementation
+# Reference: <https://github.com/vllm-project/vllm/blob/main/vllm/core/scheduler.py>
 
-class Scheduler:
-    def __init__(self, token_budget):
-        self.budget = token_budget
-        self.waiting = []
-        self.running = []
+class VLLMScheduler:
+    """
+    vLLM's production scheduler with continuous batching.
 
-    def add_request(self, req):
-        self.waiting.append(req)
+    Key features:
+    - Iteration-level scheduling
+    - PagedAttention support
+    - Chunked prefill
+    - Priority-based scheduling
+    """
 
-    def schedule(self):
-        # Move waiting to running if they fit in budget
-        remaining = self.budget
-        new_running = []
-        for req in self.waiting:
-            if req.state == 'prefill' and req.prompt_len <= remaining:
-                new_running.append(req)
-                remaining -= req.prompt_len
+    def __init__(
+        self,
+        scheduler_config: SchedulerConfig,
+        cache_config: CacheConfig,
+        parallel_config: ParallelConfig,
+    ):
+        self.scheduler_config = scheduler_config
+        self.cache_config = cache_config
+        self.parallel_config = parallel_config
+
+        # Request states
+        self.waiting: List[SequenceGroup] = []
+        self.running: List[SequenceGroup] = []
+        self.swapped: List[SequenceGroup] = []
+
+        # Resource tracking
+        self.num_running_seqs = 0
+        self.num_waiting_seqs = 0
+        self.num_swapped_seqs = 0
+
+        # Block manager for PagedAttention
+        self.block_manager = BlockSpaceManager(
+            block_size=cache_config.block_size,
+            num_gpu_blocks=cache_config.num_gpu_blocks,
+            num_cpu_blocks=cache_config.num_cpu_blocks,
+            watermark=cache_config.watermark,
+        )
+
+        # Scheduling policy
+        self.policy = PolicyFactory.create_policy(scheduler_config.policy)
+
+    def schedule(self) -> SchedulerOutputs:
+        """
+        Main scheduling loop.
+
+        Returns:
+            SchedulerOutputs with decisions for next iteration
+        """
+        # 1. Update running sequences
+        self._update_running_sequences()
+
+        # 2. Schedule from waiting queue (FCFS with priority)
+        scheduled: List[SequenceGroup] = []
+        ignored: List[SequenceGroup] = []
+
+        # Try to schedule waiting sequences
+        while self.waiting:
+            seq_group = self.waiting[0]
+
+            # Check if we can schedule this sequence
+            can_schedule = self._can_schedule_seq_group(seq_group)
+
+            if can_schedule:
+                # Allocate resources
+                self._allocate_seq_group(seq_group)
+                scheduled.append(seq_group)
+                self.waiting.pop(0)
             else:
+                # Can't schedule, stop trying
                 break
-        for req in new_running:
-            self.waiting.remove(req)
-            self.running.append(req)
 
-        # Process one step for all running requests
-        for req in self.running:
-            if req.state == 'prefill':
-                req.prompt_len -= 1
-                if req.prompt_len == 0:
-                    req.state = 'decode'
-            else:  # decode
-                req.generated += 1
-                if req.generated == req.output_len:
-                    req.done = True
-        # Remove finished
-        self.running = [r for r in self.running if not r.done]
+        # 3. Schedule swapped sequences if GPU has capacity
+        if self._has_gpu_capacity():
+            swapped_scheduled = self._schedule_swapped()
+            scheduled.extend(swapped_scheduled)
+
+        # 4. Build outputs
+        outputs = self._build_scheduler_outputs(scheduled)
+
+        return outputs
+
+    def _can_schedule_seq_group(self, seq_group: SequenceGroup) -> bool:
+        """
+        Check if a sequence group can be scheduled.
+
+        Considers:
+        - GPU memory (KV cache blocks)
+        - Computational capacity
+        - Prompt length vs. chunk size
+        """
+        # Check prompt length
+        if seq_group.prompt_len > self.scheduler_config.max_model_len:
+            return False
+
+        # Check KV cache capacity
+        num_required_blocks = self.block_manager.get_num_required_blocks(
+            seq_group.prompt_len,
+            seq_group.num_seqs,
+        )
+
+        if not self.block_manager.can_allocate(num_required_blocks):
+            return False
+
+        # Check computational capacity
+        # Based on token budget for this iteration
+        token_budget = self._get_token_budget()
+        prompt_tokens = seq_group.prompt_len
+
+        if prompt_tokens > token_budget:
+            # Can we use chunked prefill?
+            if not self.scheduler_config.chunked_prefill_enabled:
+                return False
+            # Only schedule first chunk
+            chunk_size = min(token_budget, self.scheduler_config.max_num_batched_tokens)
+            if chunk_size < self.scheduler_config.min_chunk_size:
+                return False
+
+        return True
+
+    def _build_scheduler_outputs(self, scheduled: List[SequenceGroup]) -> SchedulerOutputs:
+        """
+        Build outputs for the engine.
+        """
+        # Separate prefills and decodes
+        prefills: List[SequenceGroup] = []
+        decodes: List[SequenceGroup] = []
+
+        for seq_group in scheduled:
+            if seq_group.is_prefill():
+                prefills.append(seq_group)
+            else:
+                decodes.append(seq_group)
+
+        # Build block tables
+        block_tables = {}
+        for seq_group in scheduled:
+            for seq in seq_group.seqs:
+                block_table = self.block_manager.get_block_table(seq)
+                block_tables[seq.seq_id] = block_table
+
+        return SchedulerOutputs(
+            scheduled_seq_groups=scheduled,
+            num_prefill_groups=len(prefills),
+            num_decode_groups=len(decodes),
+            block_tables=block_tables,
+            ignore_seq_groups=[],
+        )
+
+    def _get_token_budget(self) -> int:
+        """
+        Calculate token budget for next iteration.
+
+        Token budget is based on:
+        - max_num_batched_tokens config
+        - Currently running sequences
+        - GPU utilization target
+        """
+        # Base budget
+        budget = self.scheduler_config.max_num_batched_tokens
+
+        # Subtract tokens for running decode sequences
+        for seq_group in self.running:
+            if not seq_group.is_prefill():
+                budget -= seq_group.num_seqs  # Each decode step uses 1 token
+
+        # Apply utilization target
+        utilization_target = self.scheduler_config.utilization_target
+        current_utilization = self.num_running_seqs / self.scheduler_config.max_num_seqs
+
+        if current_utilization > utilization_target:
+            # Reduce budget if over-utilized
+            budget = int(budget * (utilization_target / current_utilization))
+
+        return max(budget, self.scheduler_config.min_token_budget)
+
 ```
 
-**Enhancement:** Add a priority queue to handle requests with different SLOs.
-
-### 4.8 Production Scheduler Implementations
-
-Different frameworks implement continuous batching with variations [12,13,14]:
-
-| Framework | Scheduler Name | Key Features |
-| --- | --- | --- |
-| vLLM | PagedAttention Scheduler | Iteration-level, block tables, preemption [7] |
-| TGI | Continuous Batching | Dynamic batch sizing, token budgets [12] |
-| TensorRT-LLM | In-flight Batching | Maximum kernel fusion, overlap scheduler [13] |
-| SGLang | RadixAttention | Tree-structured cache, cache-aware routing [14] |
-
-### 4.9 Test and Verify
-
-**Predict:** If you have two requests: A (prompt 100, output 10) and B (prompt 10, output 100), and a token budget of 50, which request will finish first under your scheduler? Why?
-
-- Click to verify
-    
-    It depends on scheduling policy. If you prioritize prefill first, B’s prefill (10 tokens) may be scheduled immediately, then A’s prefill might be chunked. B will likely finish first because its short prompt allows it to enter decode quickly, and decode steps are cheap.
-    
-
-### 4.10 Checkpoint
-
-**Self-Assessment:**
-- [ ] I can explain the difference between static, dynamic, and continuous batching.
-- [ ] I can describe how a continuous batching scheduler works.
-- [ ] I have implemented a simple scheduler.
-- [ ] I understand why mixing prefill and decode is challenging.
-- [ ] I can compare scheduler implementations across frameworks.
-- [ ] I understand the concept of preemption and swapping.
-
----
-
-## Chapter 5: Advanced Optimizations
-
-### What You Will Build
-
-You will understand advanced techniques like chunked prefill, sliding window attention, prefix caching, and KV cache eviction. You will calculate memory savings and predict their impact.
-
-### 5.1 Context
-
-Modern inference systems employ several advanced techniques to further optimize the two-phase engine. This chapter covers chunked prefill, sliding window attention, prefix caching, and KV cache eviction.
-
-### 5.2 Think First: Prefix Sharing
-
-**Question:** Consider a chatbot where every conversation starts with the system prompt “You are a helpful assistant.” This prompt is 20 tokens long. If 500 users are chatting simultaneously, how much memory can prefix caching save if the KV cache per user is 1 GB? Assume the system prompt’s KV cache is 10 MB.
-
-- Click to calculate
-    
-    Without prefix caching: each user stores the full KV cache (1 GB) = 500 GB total.
-    
-    With prefix caching: the system prompt’s KV cache (10 MB) is stored once and shared. Each user only stores their unique conversation after the prompt. If average conversation length is 1000 tokens, each user’s unique cache is 1 GB - 10 MB = 990 MB. Total = 10 MB + 500 × 990 MB ≈ 10 MB + 495 GB ≈ 495 GB. Saving = 5 GB. The saving grows with the number of users.
-    
-
-### 5.3 Chunked Prefill (Chunked Context)
-
-Long prompts can block decode requests for hundreds of milliseconds. **Chunked prefill** splits a long prompt into smaller chunks and interleaves them with decode steps [11].
-
-```mermaid
-flowchart LR
-    subgraph Without Chunking
-        A[Long prefill: 500ms] --> B[Decode step 1] --> C[Decode step 2]
-    end
-    subgraph With Chunking
-        D[Prefill chunk 1: 50ms] --> E[Decode step 1] --> F[Prefill chunk 2: 50ms] --> G[Decode step 2] --> H[Prefill chunk 3: 50ms]
-    end
-```
-
-Benefits of chunked prefill [11]:
-
-1. **Prevents bottleneck:** Context phase no longer blocks decode requests
-2. **Higher concurrency:** Memory usage depends on chunk size, not prompt length
-3. **Better GPU utilization:** Interleaves compute-bound and memory-bound work
-
-To enable in TensorRT-LLM [13]:
+**4.6.2 Hugging Face TGI Scheduler**
 
 ```python
-llm = LLM(
-    model="meta-llama/Llama-2-7b-hf",
-    enable_chunked_prefill=True,
-    max_num_tokens=8192  # Should be multiple of block size
-)
+# Hugging Face Text Generation Inference scheduler
+# Based on: <https://github.com/huggingface/text-generation-inference>
+
+class TGIScheduler:
+    """
+    TGI's continuous batching scheduler.
+
+    Key differences from vLLM:
+    - Different memory management
+    - Different chunking strategy
+    - Support for more model architectures
+    """
+
+    def __init__(self, config: TGIConfig):
+        self.config = config
+        self.batch_state = BatchState()
+
+        # Request queues
+        self.pending_requests: Deque[Request] = deque()
+        self.next_batch_requests: List[Request] = []
+
+        # Batch state
+        self.current_batch: Optional[Batch] = None
+        self.next_batch: Optional[Batch] = None
+
+    def schedule(self) -> Optional[Batch]:
+        """
+        Schedule next batch.
+
+        Returns:
+            Next batch to execute, or None if nothing to do
+        """
+        # 1. Move finished requests out of current batch
+        if self.current_batch:
+            self._process_finished_requests()
+
+        # 2. Schedule new requests into next batch
+        self._schedule_new_requests()
+
+        # 3. Check if we should execute next batch
+        if self._should_execute_next_batch():
+            # Swap batches
+            self.current_batch = self.next_batch
+            self.next_batch = None
+            return self.current_batch
+
+        return None
+
+    def _schedule_new_requests(self):
+        """Schedule new requests into next batch."""
+        if not self.pending_requests:
+            return
+
+        # Calculate capacity
+        max_batch_size = self.config.max_batch_size
+        max_sequence_length = self.config.max_sequence_length
+
+        # Build next batch
+        next_batch_requests = []
+        next_batch_total_tokens = 0
+
+        while self.pending_requests:
+            request = self.pending_requests[0]
+
+            # Calculate tokens for this request
+            if request.state == RequestState.PREFILL:
+                request_tokens = request.input_length
+            else:  # DECODE
+                request_tokens = 1
+
+            # Check if request fits
+            if (len(next_batch_requests) < max_batch_size and
+                next_batch_total_tokens + request_tokens <= max_sequence_length):
+
+                # Add to batch
+                next_batch_requests.append(request)
+                next_batch_total_tokens += request_tokens
+                self.pending_requests.popleft()
+
+                # Update request state
+                if request.state == RequestState.PREFILL:
+                    request.state = RequestState.DECODE
+            else:
+                # Batch is full
+                break
+
+        # Create batch
+        if next_batch_requests:
+            self.next_batch = Batch(
+                requests=next_batch_requests,
+                total_tokens=next_batch_total_tokens,
+                max_sequence_length=max_sequence_length,
+            )
+
+    def _should_execute_next_batch(self) -> bool:
+        """
+        Decide if we should execute next batch now.
+
+        Based on:
+        - Whether current batch is empty
+        - Size of next batch
+        - Time since last execution
+        - Priority of requests
+        """
+        if not self.next_batch:
+            return False
+
+        # If no current batch, execute immediately
+        if not self.current_batch:
+            return True
+
+        # If next batch is large enough
+        min_batch_size = self.config.min_batch_size
+        if len(self.next_batch.requests) >= min_batch_size:
+            return True
+
+        # If current batch is almost done
+        if self.current_batch and self.current_batch.num_remaining_tokens <= 1:
+            return True
+
+        # Time-based scheduling
+        time_since_last_execution = time.time() - self.last_execution_time
+        if time_since_last_execution >= self.config.max_waiting_time:
+            return True
+
+        return False
+
 ```
 
-### 5.4 Sliding Window Attention and Cyclic KV Cache
-
-Sliding window attention limits each token’s attention span to a fixed-size window, dramatically reducing computation and memory [15].
-
-```mermaid
-graph TD
-    subgraph SlidingWindow[Sliding Window Attention, Window Size=3]
-        W1[T5 attends to T2,T3,T4]
-        W2[T6 attends to T3,T4,T5]
-        W3[T7 attends to T4,T5,T6]
-    end
-
-    subgraph CyclicKV[Cyclic KV Cache]
-        B0[Block 0: tokens 1-64]
-        B1[Block 1: tokens 65-128]
-        B2[Block 2: tokens 129-192]
-        New[New token 193 overwrites block 0]
-    end
-```
-
-TensorRT-LLM implements this as a circular buffer [13]:
+**4.6.3 Scheduler with Quality of Service (QoS)**
 
 ```python
-kv_cache_config = KvCacheConfig(
-    max_attention_window=[2048, 2048, ...]  # Per-layer window sizes
-)
-llm = LLM(..., kv_cache_config=kv_cache_config)
+# Scheduler with QoS support
+class QoScheduler:
+    """
+    Scheduler with Quality of Service guarantees.
+
+    Supports:
+    - Priority classes (high, medium, low)
+    - Service Level Agreements (SLAs)
+    - Fair resource allocation
+    """
+
+    def __init__(self, qos_config: QoSConfig):
+        self.config = qos_config
+
+        # Priority queues
+        self.queues = {
+            Priority.HIGH: deque(),
+            Priority.MEDIUM: deque(),
+            Priority.LOW: deque(),
+        }
+
+        # SLA tracking
+        self.sla_violations = defaultdict(int)
+        self.response_times = defaultdict(list)
+
+        # Resource allocation
+        self.resource_allocation = {
+            Priority.HIGH: 0.5,  # 50% of resources
+            Priority.MEDIUM: 0.3,  # 30%
+            Priority.LOW: 0.2,  # 20%
+        }
+
+    def schedule(self) -> List[Request]:
+        """
+        Schedule with QoS guarantees.
+        """
+        scheduled = []
+        resource_budget = self._calculate_resource_budget()
+
+        # Allocate resources per priority class
+        for priority in [Priority.HIGH, Priority.MEDIUM, Priority.LOW]:
+            # Calculate budget for this priority
+            priority_budget = int(resource_budget * self.resource_allocation[priority])
+
+            if priority_budget <= 0:
+                continue
+
+            # Schedule from this priority queue
+            priority_scheduled = self._schedule_from_queue(
+                self.queues[priority],
+                priority_budget,
+                priority,
+            )
+            scheduled.extend(priority_scheduled)
+
+            # Update budget
+            resource_budget -= len(priority_scheduled)
+
+        # Check for SLA violations
+        self._check_sla_violations(scheduled)
+
+        return scheduled
+
+    def _schedule_from_queue(
+        self,
+        queue: deque,
+        budget: int,
+        priority: Priority,
+    ) -> List[Request]:
+        """
+        Schedule requests from a specific queue.
+        """
+        scheduled = []
+
+        while queue and budget > 0:
+            request = queue[0]
+
+            # Check if request fits in budget
+            request_cost = self._calculate_request_cost(request)
+
+            if request_cost <= budget:
+                scheduled.append(queue.popleft())
+                budget -= request_cost
+
+                # Track for SLA
+                request.scheduled_time = time.time()
+                self.response_times[priority].append(request)
+            else:
+                # Request doesn't fit, try next
+                break
+
+        return scheduled
+
+    def _calculate_request_cost(self, request: Request) -> int:
+        """
+        Calculate resource cost of a request.
+
+        Based on:
+        - Prompt length
+        - Expected output length
+        - Model complexity
+        - Priority
+        """
+        base_cost = request.prompt_length
+
+        # Adjust for expected output length
+        if request.generation_config:
+            expected_tokens = request.generation_config.max_new_tokens
+            base_cost += expected_tokens * 0.1  # Decode cost factor
+
+        # Priority multiplier
+        priority_multiplier = {
+            Priority.HIGH: 1.0,
+            Priority.MEDIUM: 0.7,
+            Priority.LOW: 0.5,
+        }
+
+        cost = base_cost * priority_multiplier.get(request.priority, 1.0)
+
+        return int(cost)
+
+    def _check_sla_violations(self, scheduled: List[Request]):
+        """
+        Check for SLA violations and adjust scheduling.
+        """
+        current_time = time.time()
+
+        for request in scheduled:
+            # Calculate waiting time
+            waiting_time = current_time - request.arrival_time
+
+            # Check against SLA
+            sla = self.config.slas.get(request.priority)
+            if sla and waiting_time > sla.max_waiting_time:
+                self.sla_violations[request.priority] += 1
+
+                # Adjust resource allocation if too many violations
+                violation_rate = (
+                    self.sla_violations[request.priority] /
+                    len(self.response_times[request.priority])
+                )
+
+                if violation_rate > self.config.max_violation_rate:
+                    self._adjust_resource_allocation(request.priority)
+
+    def _adjust_resource_allocation(self, priority: Priority):
+        """
+        Adjust resource allocation based on SLA violations.
+        """
+        # Increase allocation for violated priority
+        increase = 0.05
+        self.resource_allocation[priority] += increase
+
+        # Decrease from other priorities proportionally
+        total_other = sum(
+            v for k, v in self.resource_allocation.items()
+            if k != priority
+        )
+
+        for other_priority in self.resource_allocation:
+            if other_priority != priority:
+                proportion = self.resource_allocation[other_priority] / total_other
+                decrease = increase * proportion
+                self.resource_allocation[other_priority] -= decrease
+
+        # Ensure all allocations are positive
+        self.resource_allocation = {
+            k: max(v, 0.1)  # Minimum 10%
+            for k, v in self.resource_allocation.items()
+        }
+
+        # Normalize to sum to 1.0
+        total = sum(self.resource_allocation.values())
+        self.resource_allocation = {
+            k: v / total
+            for k, v in self.resource_allocation.items()
+        }
+
 ```
 
-### 5.5 Prefix Caching
+## **5. Advanced Optimization: Chunked Prefill**
 
-Many requests share common prefixes (system prompts, chat templates). Prefix caching stores KV cache for these prefixes and reuses them across requests [7,14].
+### **5.1 Mathematical Model of Chunked Prefill**
+
+**Concept Intuition:**
+"Chunking" solves the "semi-truck" problem mentioned earlier.
+If a prompt is huge (e.g., 100k tokens), processing it all at once (Prefill) would freeze the GPU for seconds, blocking all the little "motorbike" (Decode) requests.
+Chunked prefill breaks the huge prompt into bite-sized pieces. It processes one piece, then lets some decode requests run, then processes another piece. It interleaves the heavy lifting with the light work.
+
+For prompt length P, chunk size C:
+
+```
+Total chunks = ceil(P / C)
+Prefill time = Σ_{i=1}^{chunks} T_prefill(C_i) + (chunks - 1) × T_scheduling
+
+```
+
+Where C_i ≤ C and Σ C_i = P.
+
+### **5.2 Chunked Prefill Architecture**
 
 ```mermaid
-graph TD
-    subgraph SharedPrefix[Shared System Prompt]
-        P1[Token 1: 'You are a helpful assistant']
-        P2[Token 2: 'Answer the following question']
+flowchart TD
+    subgraph Architecture["Chunked Prefill Architecture"]
+        direction TB
+
+        subgraph Input["Input Processing"]
+            Prompt["Long Prompt"]
+            Split["Chunk Splitter"]
+            Chunks["Chunk1, Chunk2, ..."]
+        end
+
+        subgraph Execution["Execution Engine"]
+            Scheduler["Chunk Scheduler"]
+            Executor["Chunk Executor"]
+            CacheMgr["Cache Manager"]
+        end
+
+        subgraph Output["Output Generation"]
+            Cache["KV Cache"]
+            Decoder["Decoder"]
+            Stream["Token Stream"]
+        end
+
+        Input --> Execution --> Output
+
+        subgraph Policies["Scheduling Policies"]
+            Fixed["Fixed Chunk Size"]
+            Adaptive["Adaptive Chunking"]
+            Priority["Priority-Aware"]
+        end
+
+        Scheduler --> Policies
     end
 
-    subgraph Divergent[Divergent User Messages]
-        U1[User 1: 'What is Python?']
-        U2[User 2: 'Explain quantum computing']
+    subgraph Tradeoffs["Trade-offs"]
+        TTFTA["TTFT Impact"]
+        TPOTA["TPOT Impact"]
+        MemoryA["Memory Overhead"]
+        ComplexityA["System Complexity"]
     end
 
-    P1 --> P2
-    P2 --> U1
-    P2 --> U2
-    Note[KV cache for P1,P2 computed once, shared]
-```
+    Architecture --> Tradeoffs
 
-**Memory savings example** [7]:
-- 200 tokens of shared prefix
-- 300 concurrent users
-- 20GB memory saved (from 19.6GB to 65MB)
-
-### 5.6 RadixAttention (SGLang)
-
-SGLang extends prefix caching with a radix tree structure, enabling efficient sharing of arbitrary common prefixes [14].
-
-```mermaid
-graph TD
-    Root[Root] --> A['/']
-    A --> B['/chat']
-    A --> C['/search']
-    B --> D['/chat/1']
-    B --> E['/chat/2']
-    C --> F['/search/query1']
-    C --> G['/search/query2']
-```
-
-### 5.7 KV Cache Eviction and Quantization
-
-For extremely long contexts (100K+ tokens), even PagedAttention may not suffice. Recent research explores cache eviction and quantization [16,17,18].
-
-```mermaid
-graph TD
-    subgraph EvictionStrategies[KV Cache Optimization]
-        S1[KIVI: 2-4 bit quantization [16]]
-        S2[StreamingLLM: keep sink + recent tokens [17]]
-        S3[Ada-KV: adaptive budget allocation [18]]
-        S4[DuoAttention: full cache only for retrieval heads [19]]
+    subgraph Optimization["Optimization Techniques"]
+        Overlap["Compute-IO Overlap"]
+        Prefetch["Prefetching"]
+        Spec["Speculative Execution"]
     end
+
+    Tradeoffs --> Optimization
+
 ```
 
-**Ada-KV** (Feng et al., 2024) adaptively allocates KV cache budgets across attention heads, reducing eviction loss [18].
+*Diagram 5.1: Chunked Prefill Architecture.*
 
-### 5.8 Disaggregated Architecture
+**Detailed Explanation for Researchers:**
+Chunked Prefill (also known as "Piggybacking" or "Sarathi" style scheduling) addresses the specific pathology of "Long Prompt + Short Output" requests causing latency spikes.
+*   **The Artifact:** Without chunking, a generic 500ms prefill job is an atomic unit. If it starts, no other request can generate a token for 500ms. This ruins the P99 latency stats (Inter-Token Latency) for all concurrent users.
+*   **The Mechanism:** The Architecture splits the prompt processing loop. Instead of `for i in 0..PromptLen`, it becomes `for i in 0..ChunkSize..PromptLen`.
+*   **The State Complexity:** The main research challenge is managing the `KV Cache` state. Intermediate KV/Activation states must be persisted correctly between chunks without recomputing, essentially treating a "Prefill" as a "Macro-Decode" step. This requires careful alignment with the PagedAttention Block tables.
 
-Because prefill and decode have different hardware requirements, some systems separate them onto different GPU clusters [20].
+### **5.3 Chunk Scheduling Strategies**
 
 ```mermaid
-flowchart LR
-    Client --> Gateway
-    Gateway --> PrefillCluster[Prefill Nodes<br/>Compute‑optimized<br/>H100]
-    PrefillCluster --> CacheStore[KV Cache Store<br/>High‑speed fabric<br/>InfiniBand/NVLink]
-    CacheStore --> DecodeCluster[Decode Nodes<br/>Memory‑optimized<br/>A100 with large HBM]
-    DecodeCluster --> Client
+stateDiagram-v2
+    state "Long Prompt Arrives" as Start
+    state "Split into Chunks" as Split
+    state "Schedule First Chunk" as First
+    state "Execute Chunk" as Execute
+    state "Update Cache" as Update
+    state "More Chunks?" as Check
+    state "Begin Decode" as Decode
+    state "Interleave Chunks" as Interleave
+
+    Start --> Split
+    Split --> First
+    First --> Execute
+    Execute --> Update
+    Update --> Check
+
+    Check --> First : Yes
+    Check --> Decode : No
+
+    state Interleave {
+        Decode --> ScheduleNext : After N decodes
+        ScheduleNext --> ExecuteNext
+        ExecuteNext --> UpdateNext
+        UpdateNext --> Decode
+    }
+
+    note right of Interleave
+        Interleaving allows:
+        - Smooth streaming
+        - Fair resource sharing
+        - Predictable latency
+    end note
+
 ```
 
-TensorRT-LLM added disaggregation support with pipeline parallelism in 2025 [13].
+*Diagram 5.2: Chunk Scheduling State Machine.* This diagram shows the state machine for chunk scheduling.
 
-### 5.9 Implementation Exercise
-
-Research one of the following papers and write a one‑paragraph summary of how it optimizes prefill or decode:
-
-- “FlashAttention: Fast and Memory‑Efficient Exact Attention with IO‑Awareness” [3]
-- “PagedAttention: Attention with Block‑Wise KV Cache for LLM Serving” [7]
-- “Ada-KV: Optimizing KV Cache Eviction by Adaptive Budget Allocation” [18]
-- “StreamingLLM: Efficient Streaming Language Models with Attention Sinks” [17]
-
-### 5.10 Checkpoint
-
-**Self-Assessment:**
-- [ ] I can explain chunked prefill and its benefits.
-- [ ] I understand how sliding window attention reduces memory.
-- [ ] I can describe prefix caching and calculate memory savings.
-- [ ] I know about advanced techniques like KV eviction and disaggregation.
-- [ ] I can compare different cache eviction strategies.
-
----
-
-## Chapter 6: Putting It All Together – Production Optimization Checklist
-
-### 6.1 The Optimization Levers
-
-Based on the comprehensive guide from Hugging Face [21] and production experience, here are the optimization levers in order of impact:
+### **5.4 Memory Management for Chunked Prefill**
 
 ```mermaid
-graph TD
-    subgraph Levers[Optimization Levers]
-        L1[1. Continuous batching + paged KV]
-        L2[2. Weight quantization (4-bit)]
-        L3[3. Chunked prefill]
-        L4[4. FlashAttention]
-        L5[5. Prefix caching]
-        L6[6. Speculative decoding]
-        L7[7. CUDA Graphs + kernel fusion]
+flowchart TD
+    subgraph Memory["Memory Management"]
+        direction TB
+
+        subgraph Allocation["Chunk Allocation"]
+            Cont["Contiguous Allocation"]
+            Paged["Paged Allocation"]
+            Hybrid["Hybrid Approach"]
+        end
+
+        subgraph Cache["Cache Management"]
+            Write["Write Strategy"]
+            Merge["Merge Strategy"]
+            Evict["Eviction Policy"]
+        end
+
+        subgraph Sharing["Sharing Opportunities"]
+            Prefix["Prefix Sharing"]
+            Layer["Partial Layer Sharing"]
+            Head["Attention Head Sharing"]
+        end
+
+        Allocation --> Cache --> Sharing
+
+        subgraph Optimization["Optimizations"]
+            Buffer["Double Buffering"]
+            Prefetch["Smart Prefetch"]
+            Compress["On-the-fly Compression"]
+        end
+
+        Sharing --> Optimization
     end
-    L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+
+    subgraph Challenges["Challenges"]
+        Frag["Fragmentation"]
+        Overhead["Management Overhead"]
+        Consistency["Cache Consistency"]
+    end
+
+    Memory --> Challenges
+
+    subgraph Solutions["Solutions"]
+        Virtual["Virtual Memory"]
+        Copy["Copy-on-Write"]
+        Version["Versioning"]
+    end
+
+    Challenges --> Solutions
+
 ```
 
-### 6.2 Production-Ready Configuration Examples
+*Diagram 5.3: Memory Management for Chunked Prefill.* This diagram shows memory management strategies for chunked prefill.
 
-**TGI with continuous batching and quantization** [12]:
-
-```bash
-text-generation-launcher \
-  --model-id meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --num-shard 1 \
-  --max-input-length 131072 \
-  --quantize bitsandbytes
-```
-
-**vLLM with PagedAttention and prefix caching** [7]:
-
-```bash
-vllm serve meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --enable-prefix-caching \
-  --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.9
-```
-
-**TensorRT-LLM with in-flight batching** [13]:
-
-```bash
-trtllm-build --checkpoint-dir ckpt --gemm-plugin auto --enable_context_fmha
-tritonserver --model-repository=/models  # TRT-LLM backend with IFB
-```
-
-### 6.3 Framework Comparison
-
-| Feature | vLLM | TGI | TensorRT-LLM |
-| --- | --- | --- | --- |
-| Continuous batching | ✓ | ✓ | ✓ (in-flight) |
-| PagedAttention | ✓ | Partial | ✓ |
-| Chunked prefill | ✓ | ✓ | ✓ |
-| Prefix caching | ✓ | ✓ (v3) | ✓ |
-| Multi-LoRA | ✓ (June 2024) | ✓ (April 2024) | ✓ |
-| Speculative decoding | Partial | ✓ | ✓ |
-| Disaggregation | Research | No | ✓ (2025) [13] |
-
-### 6.4 Decision Tree for Optimizations
-
-When optimizing your inference stack, follow this decision tree:
+### **5.5 Performance Characteristics**
 
 ```mermaid
 graph TD
-    Start[Start] --> Q1{Latency SLO strict?}
-    Q1 -->|Yes| Use[Use small batch, prioritize decode]
-    Q1 -->|No| Q2{Throughput critical?}
-    Q2 -->|Yes| UseCont[Use continuous batching, large batch]
-    Q2 -->|No| Q3{Memory constrained?}
-    Q3 -->|Yes| UseQuant[Quantize weights, use PagedAttention]
-    Q3 -->|No| Q4{Long prompts common?}
-    Q4 -->|Yes| UseChunk[Enable chunked prefill]
-    Q4 -->|No| UseFlash[Use FlashAttention]
+    subgraph Characteristics["Performance Characteristics"]
+        A["Without Chunking"] --> B["Long Prefill Blocking"]
+        A --> C["High TTFT Variance"]
+        A --> D["Poor TPOT for Others"]
+
+        E["With Chunking"] --> F["Smooth Prefill"]
+        E --> G["Predictable TTFT"]
+        E --> H["Good TPOT for All"]
+
+        I["Small Chunks"] --> J["Better Fairness"]
+        I --> K["Higher Overhead"]
+
+        L["Large Chunks"] --> M["Lower Overhead"]
+        L --> N["Less Fairness"]
+    end
+
+    subgraph Optimal["Optimal Point"]
+        O["Adaptive Chunk Size"]
+        P["Workload-Aware"]
+        Q["Dynamic Adjustment"]
+    end
+
+    F & G & H & J & M --> O
+
 ```
 
-### 6.5 Performance Tuning Checklist
+*Diagram 5.4: Performance Characteristics.* This diagram shows the performance characteristics of different chunking strategies.
 
-- [ ]  Enable continuous batching (vLLM, TGI, TensorRT-LLM)
-- [ ]  Use PagedAttention to eliminate fragmentation
-- [ ]  Quantize weights to 4-bit (AWQ, GPTQ) if quality acceptable
-- [ ]  Enable FlashAttention (PyTorch 2.0+ or flash-attn package)
-- [ ]  Enable chunked prefill for long prompts
-- [ ]  Use prefix caching if many requests share prefixes
-- [ ]  Consider speculative decoding for latency-sensitive apps
-- [ ]  Profile with PyTorch Profiler or NVIDIA Nsight to identify bottlenecks
-- [ ]  Tune `max_num_batched_tokens` and `max_num_seqs` for your hardware
+### **5.6 Implementation: Chunked Prefill Systems**
 
----
+**5.6.1 vLLM Chunked Prefill Implementation**
 
-## Epilogue: The Complete System
+```python
+# vLLM's chunked prefill implementation
+# Based on: <https://github.com/vllm-project/vllm/blob/main/vllm/worker/model_runner.py>
 
-You have now explored the two‑phase engine from the ground up. You understand:
+class ChunkedPrefillExecutor:
+    """Executor for chunked prefill."""
 
-- Why inference must be sequential and how the KV cache makes it feasible.
-- Why prefill is compute‑bound and decode is memory‑bound.
-- How continuous batching and PagedAttention enable high throughput.
-- How advanced techniques like chunked prefill, prefix caching, and disaggregation push performance further.
+    def __init__(self, config: ChunkedPrefillConfig):
+        self.config = config
+        self.chunk_size = config.chunk_size
+        self.max_pending_chunks = config.max_pending_chunks
 
-Your mental model of LLM serving now includes the critical trade‑offs that engineers face when building production systems.
+        # Chunk state tracking
+        self.active_chunks: Dict[int, ChunkState] = {}
+        self.pending_chunks: Dict[int, List[Chunk]] = {}
+        self.completed_chunks: Dict[int, List[Chunk]] = {}
 
----
+    def process_long_prompt(
+        self,
+        prompt_tokens: List[int],
+        request_id: int,
+    ) -> Generator[ChunkResult, None, None]:
+        """
+        Process a long prompt in chunks.
 
-## The Principles
+        Yields results for each chunk as it completes.
+        """
+        # Split prompt into chunks
+        chunks = self._split_into_chunks(prompt_tokens, request_id)
 
-1. **Sequential dependency is fundamental** – It cannot be eliminated; it can only be managed.
-2. **Cache aggressively** – The KV cache turns quadratic complexity into linear, but at the cost of memory.
-3. **Match hardware to workload** – Prefill wants compute; decode wants memory bandwidth and capacity.
-4. **Batch to reuse weights** – Decode becomes less memory‑bound when multiple sequences share the same weights.
-5. **Schedule at iteration level** – Continuous batching maximizes utilization without starving any request.
-6. **Break long work into chunks** – Chunked prefill prevents head‑of‑line blocking.
-7. **Share common prefixes** – Prefix caching can save gigabytes of memory.
-8. **Specialize hardware when possible** – Disaggregated architectures optimize each phase independently.
+        # Store chunks
+        self.pending_chunks[request_id] = chunks
 
----
+        # Process chunks
+        while self.pending_chunks[request_id]:
+            # Get next chunk
+            chunk = self.pending_chunks[request_id].pop(0)
 
-## Troubleshooting
+            # Check if we can process now
+            if self._can_process_chunk(chunk):
+                # Execute chunk
+                result = self._execute_chunk(chunk)
 
-### Error: CUDA out of memory
+                # Update state
+                if request_id not in self.completed_chunks:
+                    self.completed_chunks[request_id] = []
+                self.completed_chunks[request_id].append(chunk)
 
-**Cause:** KV cache or model weights exceed GPU memory.
+                yield result
+            else:
+                # Requeue and try later
+                self.pending_chunks[request_id].insert(0, chunk)
+                break
 
-**Solution:** Reduce batch size, use PagedAttention (vLLM), enable chunked prefill, or offload to CPU.
+        # Check if all chunks done
+        if not self.pending_chunks[request_id]:
+            # Finalize request
+            final_result = self._finalize_request(request_id)
+            yield final_result
 
-### Error: Slow generation after many tokens
+    def _split_into_chunks(
+        self,
+        prompt_tokens: List[int],
+        request_id: int,
+    ) -> List[Chunk]:
+        """Split prompt into optimally sized chunks."""
+        chunks = []
+        prompt_len = len(prompt_tokens)
 
-**Cause:** KV cache is large, causing high memory read overhead.
+        # Adaptive chunk sizing
+        if self.config.adaptive_chunking:
+            chunk_size = self._calculate_adaptive_chunk_size(prompt_len)
+        else:
+            chunk_size = self.chunk_size
 
-**Solution:** Use FlashAttention kernels, enable sliding window attention, or consider KV cache quantization/eviction.
+if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        
+        # Split into chunks
+        for start in range(0, prompt_len, chunk_size):
+            end = min(start + chunk_size, prompt_len)
 
-### Error: First token takes too long
+            chunk = Chunk(
+                request_id=request_id,
+                tokens=prompt_tokens[start:end],
+                start_pos=start,
+                end_pos=end,
+                chunk_id=len(chunks),
+                total_chunks=math.ceil(prompt_len / chunk_size),
+            )
 
-**Cause:** Long prompt with no chunking.
+            chunks.append(chunk)
 
-**Solution:** Enable chunked prefill to interleave with decode steps.
+        return chunks
 
-### Error: OOM even with free memory
+    def _calculate_adaptive_chunk_size(self, prompt_len: int) -> int:
+        """
+        Calculate adaptive chunk size based on:
+        - Prompt length
+        - System load
+        - Available memory
+        """
+        base_size = self.chunk_size
 
-**Cause:** Memory fragmentation from contiguous allocation.
+        # Adjust based on prompt length
+        if prompt_len > 10000:
+            # Very long prompts: smaller chunks
+            return base_size // 2
+        elif prompt_len > 5000:
+            # Long prompts: normal chunks
+            return base_size
+        else:
+            # Short prompts: larger chunks
+            return min(base_size * 2, prompt_len)
 
-**Solution:** Use PagedAttention which eliminates fragmentation [7].
+    def _execute_chunk(self, chunk: Chunk) -> ChunkResult:
+        """
+        Execute a single chunk.
+        """
+        # Prepare input
+        input_tokens = torch.tensor([chunk.tokens], dtype=torch.long, device=self.device)
+        positions = torch.arange(
+            chunk.start_pos,
+            chunk.end_pos,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(0)
 
-### Error: High tail latency under load
+        # Get cache position
+        cache_positions = self._get_cache_positions(chunk)
 
-**Cause:** Prefill requests blocking decode.
+        # Execute
+        hidden_states = self.model(
+            input_ids=input_tokens,
+            positions=positions,
+            cache_positions=cache_positions,
+        )
 
-**Solution:** Implement decode-first scheduling or chunked prefill [11].
+        # Update KV cache
+        self._update_kv_cache(chunk, hidden_states)
 
-### Error: Throughput lower than expected
+        # Check if this is the last chunk
+        is_last = chunk.chunk_id == chunk.total_chunks - 1
 
-**Cause:** Batch size too small or scheduler not tuned.
+        return ChunkResult(
+            chunk=chunk,
+            hidden_state=hidden_states[:, -1, :] if is_last else None,
+            is_last=is_last,
+            next_chunk_ready=not is_last,
+        )
 
-**Solution:** Increase `max_num_batched_tokens`, enable continuous batching, and profile to find bottleneck.
+    def _get_cache_positions(self, chunk: Chunk) -> torch.Tensor:
+        """
+        Get cache positions for this chunk.
 
----
+        For chunked prefill, we need to allocate cache space
+        for the entire prompt upfront, then fill it incrementally.
+        """
+        # Get or allocate blocks for this request
+        if chunk.request_id not in self.block_tables:
+            # Allocate blocks for entire prompt
+            total_blocks_needed = math.ceil(
+                chunk.total_chunks * self.chunk_size / self.block_size
+            )
 
-## Next Steps
+            self.block_tables[chunk.request_id] = (
+                self.block_manager.allocate(total_blocks_needed)
+            )
 
-- Run a production inference engine like vLLM or TGI locally and observe its scheduling behavior.
-- Implement a simple version of PagedAttention in PyTorch.
-- Read the Splitwise paper on disaggregating prefill and decode [20].
-- Explore speculative decoding to break the sequential dependency [9].
-- Experiment with KV cache quantization using KIVI or GEAR [16].
-- Try SGLang’s RadixAttention for advanced prefix caching [14].
+        # Calculate positions for this chunk
+        block_table = self.block_tables[chunk.request_id]
+        positions = []
 
----
+        for pos in range(chunk.start_pos, chunk.end_pos):
+            block_idx = pos // self.block_size
+            block_offset = pos % self.block_size
 
-## Knowledge Check
+            block_id = block_table[block_idx]
+            cache_pos = block_id * self.block_size + block_offset
 
-**Question 1:** Explain why the KV cache is necessary for efficient inference. What would happen without it?
+            positions.append(cache_pos)
 
-- Answer
-    
-    Without KV cache, each decode step would recompute the key and value vectors for all previous tokens, leading to $O(T^2)$ complexity. The cache stores these vectors, reducing complexity to $O(T)$ and enabling practical generation lengths.
-    
+        return torch.tensor(positions, dtype=torch.long, device=self.device)
 
-**Question 2:** A model has 32 layers, hidden size 5120, and uses FP16. Calculate the KV cache size for a 2048-token sequence.
+```
 
-- Answer
-    
-    Per token per layer: 2 (key+value) × 5120 × 2 bytes = 20,480 bytes ≈ 20 KB.
-    
-    32 layers: 32 × 20 KB = 640 KB per token.
-    
-    2048 tokens: 2048 × 640 KB = 1,310,720 KB = 1.25 GB.
-    
+**5.6.2 TensorRT-LLM Chunked Prefill**
 
-**Question 3:** Why is decode phase memory‑bound while prefill is compute‑bound?
+```python
+# TensorRT-LLM chunked prefill implementation
 
-- Answer
-    
-    Prefill processes many tokens in parallel, performing large matrix multiplications with high arithmetic intensity. Decode processes one token at a time, but must load all model weights and the growing KV cache from memory, resulting in low arithmetic intensity (often <1 FLOP/byte). The GPU spends most of its time waiting for data movement.
-    
+class TRTLLMChunkedPrefill:
+    """Chunked prefill for TensorRT-LLM."""
 
-**Question 4:** What problem does PagedAttention solve? How does it work?
+    def __init__(self, trt_engine, config: ChunkedPrefillConfig):
+        self.engine = trt_engine
+        self.config = config
 
-- Answer
-    
-    PagedAttention solves memory fragmentation caused by contiguous KV cache allocation. It divides the cache into fixed-size blocks and uses a logical-to-physical mapping (block table), allowing non-contiguous storage, eliminating fragmentation, and enabling prefix sharing.
-    
+        # Create multiple execution contexts
+        self.contexts = []
+        for i in range(config.num_concurrent_chunks):
+            context = engine.create_execution_context()
+            self.contexts.append(context)
 
-**Question 5:** List three advanced techniques that improve inference performance and briefly describe each.
+        # Chunk buffer pool
+        self.buffer_pool = BufferPool(config.max_chunk_size)
 
-- Answer
-    1. **Chunked prefill:** Splits long prompts into chunks interleaved with decode steps to prevent head-of-line blocking.
-    2. **Prefix caching:** Reuses KV cache for common prefixes (e.g., system prompts) across requests to save memory.
-    3. **Speculative decoding:** Uses a draft model to propose multiple tokens, verified in parallel by the target model, reducing latency.
+    def process_prompt(
+        self,
+        prompt_tokens: List[int],
+        max_output_len: int,
+    ) -> Generator[Tuple[int, torch.Tensor], None, None]:
+        """
+        Process prompt in chunks.
 
----
+        Yields (chunk_id, next_token_logits) for each chunk.
+        """
+        # Split into chunks
+        chunks = self._split_prompt(prompt_tokens)
 
-## Additional Resources
+        # Process chunks with overlap
+        for i, chunk in enumerate(chunks):
+            # Get execution context
+            context = self.contexts[i % len(self.contexts)]
 
-### Papers
+            # Prepare buffers
+            buffers = self._prepare_buffers(chunk, max_output_len)
 
-- [1] “Attention Is All You Need” (Vaswani et al., 2017) https://arxiv.org/abs/1706.03762
-- [2] “Generating Long Sequences with Sparse Transformers” (Child et al., 2019) https://arxiv.org/abs/1904.10509
-- [3] “FlashAttention: Fast and Memory-Efficient Exact Attention” (Dao et al., 2022) https://arxiv.org/abs/2205.14135
-- [4] FlashAttention GitHub https://github.com/HazyResearch/flash-attention
-- [5] “GQA: Training Generalized Multi-Query Transformer Models” (Ainslie et al., 2023) https://arxiv.org/abs/2305.13245
-- [6] “Efficiently Scaling Transformer Inference” (Pope et al., 2022) https://arxiv.org/abs/2211.05102
-- [7] “vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention” (Kwon et al., 2023) https://arxiv.org/abs/2309.06180
-- [8] vLLM PagedAttention Documentation https://docs.vllm.ai/en/stable/design/paged_attention.html
-- [9] “Speculative Decoding” (Leviathan et al., 2022) https://arxiv.org/abs/2211.17192
-- [10] “Orca: A Distributed Serving System for Transformer-Based Generative Models” (Yu et al., 2022) https://www.usenix.org/conference/osdi22/presentation/yu
-- [11] “Sarathi: Efficient LLM Inference by Piggybacking Decodes onto Chunked Prefills” (Agrawal et al., 2024) https://arxiv.org/abs/2403.02310
-- [12] Hugging Face TGI Documentation https://huggingface.co/docs/text-generation-inference
-- [13] TensorRT-LLM Documentation https://nvidia.github.io/TensorRT-LLM/
-- [14] “SGLang: Efficient Execution of Structured Language Model Programs” (Zheng et al., 2024) https://arxiv.org/abs/2312.07104
-- [15] “Sliding Window Attention” (Beltagy et al., 2020) https://arxiv.org/abs/2004.05150
-- [16] “KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache” (Liu et al., 2024) https://arxiv.org/abs/2402.02750
-- [17] “StreamingLLM: Efficient Streaming Language Models with Attention Sinks” (Xiao et al., 2023) https://arxiv.org/abs/2309.17453
-- [18] “Ada-KV: Optimizing KV Cache Eviction by Adaptive Budget Allocation” (Feng et al., 2024) https://arxiv.org/abs/2407.11550
-- [19] “DuoAttention: Efficient Long-Context LLM Inference with Retrieval and Streaming Heads” (2024) https://arxiv.org/abs/2410.10819
-- [20] “Splitwise: Efficient generative LLM inference using phase prediction” (Patel et al., 2024) https://arxiv.org/abs/2311.18677
-- [21] Hugging Face LLM Inference Guide https://huggingface.co/docs/transformers/en/llm_tutorial
+            # Execute chunk
+            context.execute_async_v2(buffers, self.stream)
+
+            # Yield intermediate results if available
+            if self.config.yield_intermediate_results:
+                # Get logits for last position
+                logits = self._extract_logits(buffers, chunk)
+                yield i, logits
+
+            # Synchronize if needed
+            if i < len(chunks) - 1:
+                # Overlap with next chunk preparation
+                next_chunk = chunks[i + 1]
+                self._prepare_next_chunk(next_chunk)
+
+        # Final result
+        final_logits = self._get_final_logits()
+        yield len(chunks), final_logits
+
+    def _split_prompt(self, prompt_tokens: List[int]) -> List[Chunk]:
+        """
+        Split prompt for TensorRT-LLM.
+
+        TensorRT-LLM has specific requirements:
+        - Chunks must align with block boundaries
+        - Need to handle position embeddings
+        - Must maintain causality
+        """
+        chunks = []
+        prompt_len = len(prompt_tokens)
+
+        # Calculate optimal chunk size based on engine limits
+        max_seq_len = self.engine.profile.get_shape("input_ids")[1][2]
+        chunk_size = min(self.config.chunk_size, max_seq_len)
+
+        # Ensure chunks are power of two for TensorRT optimizations
+        chunk_size = self._round_to_power_of_two(chunk_size)
+
+        # Split
+        for start in range(0, prompt_len, chunk_size):
+            end = min(start + chunk_size, prompt_len)
+
+            # Pad if necessary
+            if end - start < chunk_size:
+                pad_len = chunk_size - (end - start)
+                chunk_tokens = prompt_tokens[start:end] + [self.pad_token_id] * pad_len
+            else:
+                chunk_tokens = prompt_tokens[start:end]
+
+            chunk = Chunk(
+                tokens=chunk_tokens,
+                start_pos=start,
+                end_pos=end,
+                actual_len=end - start,
+                padded_len=chunk_size,
+            )
+
+            chunks.append(chunk)
+
+        return chunks
+
+    def _prepare_buffers(self, chunk: Chunk, max_output_len: int) -> List[int]:
+        """
+        Prepare buffers for TensorRT execution.
+        """
+        # Get buffers from pool
+        buffers = self.buffer_pool.acquire()
+
+        # Set input tensor
+        input_ids = torch.tensor([chunk.tokens], dtype=torch.int32)
+        buffers[0].copy_(input_ids)
+
+        # Set sequence lengths
+        sequence_lengths = torch.tensor([chunk.actual_len], dtype=torch.int32)
+        buffers[1].copy_(sequence_lengths)
+
+        # Set position ids
+        position_ids = torch.arange(
+            chunk.start_pos,
+            chunk.start_pos + chunk.padded_len,
+            dtype=torch.int32,
+        ).unsqueeze(0)
+        buffers[2].copy_(position_ids)
+
+        # Set cache indices
+        cache_indices = self._get_cache_indices(chunk)
+        buffers[3].copy_(cache_indices)
+
+        return buffers
+
+    def _get_cache_indices(self, chunk: Chunk) -> torch.Tensor:
+        """
+        Get KV cache indices for this chunk.
+
+        TensorRT-LLM uses a specific cache layout that we need to follow.
+        """
+        # Calculate which cache blocks this chunk uses
+        start_block = chunk.start_pos // self.block_size
+        end_block = (chunk.end_pos - 1) // self.block_size + 1
+        num_blocks = end_block - start_block
+
+        # Create index tensor
+        indices = torch.zeros(
+            (1, num_blocks, 2),  # [batch, num_blocks, 2 for K/V]
+            dtype=torch.int32,
+        )
+
+        for i in range(num_blocks):
+            block_id = start_block + i
+
+            # Key cache pointer
+            key_ptr = block_id * self.block_size * self.num_kv_heads * self.head_size
+
+            # Value cache pointer (stored separately)
+            value_ptr = (
+                self.num_blocks * self.block_size * self.num_kv_heads * self.head_size +
+                block_id * self.block_size * self.num_kv_heads * self.head_size
+            )
+
+            indices[0, i, 0] = key_ptr
+            indices[0, i, 1] = value_ptr
+
+        return indices
+
+```
+
+## **6. Advanced Architecture: Disaggregated Prefill/Decode**
+
+### **6.1 Mathematical Model of Disaggregation**
+
+**Concept Intuition:**
+Since Prefill is "Compute-Bound" and Decode is "Memory-Bound", using the same hardware for both is inefficient. It's like using a Ferrari (fast but small trunk) to move furniture, or a Dump Truck (big but slow) to race.
+Disaggregation uses "Dump Trucks" (Compute-optimized GPUs) for Prefill and "Ferraris" (Memory-bandwidth optimized GPUs) for Decode, transferring the data (KV Cache) between them.
+
+Let:
+
+- T_prefill(P) = time to prefill prompt length P
+- T_decode(N) = time to decode N tokens
+- T_transfer(C) = time to transfer cache size C
+
+With disaggregation:
+
+```
+Total time = T_prefill(P) + T_transfer(C) + T_decode(N)
+
+```
+
+Without disaggregation:
+
+```
+Total time = T_prefill(P) + T_decode(N) on same hardware
+
+```
+
+### **6.2 Disaggregated Architecture Diagram**
+
+```mermaid
+flowchart TD
+    subgraph Architecture["Disaggregated Architecture"]
+        direction TB
+
+        subgraph Gateway["API Gateway"]
+            LB["Load Balancer"]
+            Router["Request Router"]
+            Monitor["Health Monitor"]
+        end
+
+        subgraph PrefillCluster["Prefill Cluster"]
+            direction LR
+            P1["Prefill Node 1<br/>H100/Compute"]
+            P2["Prefill Node 2"]
+            P3["Prefill Node 3"]
+        end
+
+        subgraph DecodeCluster["Decode Cluster"]
+            direction LR
+            D1["Decode Node 1<br/>A100/Memory"]
+            D2["Decode Node 2"]
+            D3["Decode Node 3"]
+            D4["Decode Node 4"]
+        end
+
+        subgraph Storage["Shared Storage"]
+            CacheStore[("KV Cache Store")]
+            ModelStore[("Model Weights")]
+            ConfigStore[("Configuration")]
+        end
+
+        Gateway --> PrefillCluster
+        PrefillCluster --> CacheStore
+        CacheStore --> DecodeCluster
+        DecodeCluster --> Gateway
+
+        subgraph Control["Control Plane"]
+            Scheduler["Global Scheduler"]
+            Orchestrator["Orchestrator"]
+            Autoscaler["Autoscaler"]
+        end
+
+        Gateway --> Control
+        Control --> PrefillCluster
+        Control --> DecodeCluster
+    end
+
+    subgraph DataFlow["Data Flow"]
+        Req["Request In"]
+        Prefill["Prefill Execution"]
+        CacheWrite["Cache Serialization"]
+        Transfer["Network Transfer"]
+        CacheRead["Cache Deserialization"]
+        Decode["Decode Execution"]
+        Resp["Response Out"]
+
+        Req --> Prefill --> CacheWrite --> Transfer --> CacheRead --> Decode --> Resp
+    end
+
+    Architecture --> DataFlow
+
+```
+
+*Diagram 6.1: Disaggregated Architecture.*
+
+**Detailed Explanation for Researchers:**
+Disaggregation (Splitwise/TetriSched) represents the frontier of inference system design (2024+).
+*   **Hardware Specialization:**
+    *   **Prefill Nodes:** These require massive Compute (FLOPs) but less Memory Bandwidth relative to the math. H100s or even older A100s are good here, configured solely to crunch the prompt.
+    *   **Decode Nodes:** These are Memory-Bound. We want massive High Bandwidth Memory (HBM) capacity and speed, but we don't need as many Tensor Cores.
+*   **The Network Bottleneck:** The critical challenge (represented by the arrows to "KV Cache Store") is transferring the KV Cache from Prefill Node to Decode Node. A 1000-token prompt generates MBs of KV cache. Transferring this over PCIe/Network must be faster than just recomputing it, or the architecture fails.
+*   **KV-Cache Offloading**: In state-of-the-art implementations, the "KV Cache Store" is not a disk but a high-speed RdDMA (Remote Direct Memory Access) transfer directly between GPU memories over InfiniBand.
+
+### **6.3 Cache Transfer Protocol**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant Prefill
+    participant CacheStore
+    participant Decode
+    participant Scheduler
+
+    Client->>Gateway: Send Request
+    Gateway->>Scheduler: Route Request
+    Scheduler->>Prefill: Assign Prefill Node
+    Prefill->>Prefill: Execute Prefill
+    Prefill->>CacheStore: Serialize & Store KV Cache
+    Prefill->>Scheduler: Prefill Complete
+
+    Scheduler->>Decode: Assign Decode Node
+    Decode->>CacheStore: Fetch KV Cache
+    CacheStore->>Decode: Transfer Cache
+
+    loop Each Token
+        Decode->>Decode: Generate Token
+        Decode->>Client: Stream Token
+    end
+
+    Decode->>Scheduler: Generation Complete
+    Scheduler->>CacheStore: Cleanup Cache
+
+```
+
+*Diagram 6.2: Cache Transfer Sequence.* This sequence diagram shows the cache transfer protocol in a disaggregated system.
+
+### **6.4 Resource Allocation Strategies**
+
+```mermaid
+graph TD
+    subgraph Allocation["Resource Allocation Strategies"]
+        Fixed["Fixed Allocation"]
+        Dynamic["Dynamic Allocation"]
+        Predictive["Predictive Allocation"]
+
+        Fixed --> FixedP["Fixed Ratio"]
+        Fixed --> FixedS["Static Partitioning"]
+
+        Dynamic --> DynamicL["Load-Based"]
+        Dynamic --> DynamicP["Priority-Based"]
+
+        Predictive --> PredictiveH["Historical"]
+        Predictive --> PredictiveM["Machine Learning"]
+    end
+
+    subgraph Metrics["Allocation Metrics"]
+        Utilization["Utilization Rate"]
+        Latency["End-to-End Latency"]
+        Cost["Cost Efficiency"]
+        Fairness["Fairness Index"]
+    end
+
+    Allocation --> Metrics
+
+    subgraph Optimization["Optimization Techniques"]
+        BinPacking["Bin Packing"]
+        LoadBalancing["Load Balancing"]
+        AutoScaling["Auto Scaling"]
+    end
+
+    Metrics --> Optimization
+
+```
+
+*Diagram 6.3: Resource Allocation Strategies.* This diagram shows different resource allocation strategies for disaggregated systems.
+
+### **6.5 Failure Handling and Recovery**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+    Normal --> PrefillFailure : Prefill Node Fails
+    Normal --> DecodeFailure : Decode Node Fails
+    Normal --> CacheFailure : Cache Store Fails
+    Normal --> NetworkFailure : Network Partition
+
+    state PrefillFailure {
+        [*] --> Detect
+        Detect --> Redirect : Redirect to Backup
+        Redirect --> Continue : Continue Prefill
+        Continue --> [*]
+    }
+
+    state DecodeFailure {
+        [*] --> DetectDecode
+        DetectDecode --> Migrate : Migrate Cache
+        Migrate --> Resume : Resume on Backup
+        Resume --> [*]
+    }
+
+    state CacheFailure {
+        [*] --> DetectCache
+        DetectCache --> Replicate : Use Replica
+        Replicate --> Recover : Recover State
+        Recover --> [*]
+    }
+
+    state NetworkFailure {
+        [*] --> Partition
+        Partition --> Quorum : Maintain Quorum
+        Quorum --> Heal : Network Heals
+        Heal --> Sync : Sync State
+        Sync --> [*]
+    }
+
+    note right of Normal
+        Failure detection via:
+        - Heartbeats
+        - Timeouts
+        - Health checks
+    end note
+
+```
+
+*Diagram 6.4: Failure Handling State Machine.* This diagram shows the failure handling and recovery mechanisms.
+
+### **6.6 Implementation: Disaggregated Systems**
+
+**6.6.1 Cache Serialization Protocol**
+
+```python
+# Cache serialization for disaggregated systems
+# Based on Apache Arrow for efficient serialization
+
+class CacheSerializer:
+    """Serialize KV cache for network transfer."""
+
+    def __init__(self, config: SerializerConfig):
+        self.config = config
+        self.compressor = self._create_compressor()
+
+    def serialize_cache(
+        self,
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        metadata: CacheMetadata,
+    ) -> bytes:
+        """
+        Serialize KV cache to bytes.
+
+        Uses format:
+        [Header][Metadata][Layer1 K][Layer1 V]...[LayerN K][LayerN V]
+        """
+        # Create header
+        header = self._create_header(metadata)
+
+        # Serialize metadata
+        metadata_bytes = self._serialize_metadata(metadata)
+
+        # Serialize each layer
+        layer_data = []
+        for layer_idx, (k_cache, v_cache) in enumerate(kv_cache):
+            layer_bytes = self._serialize_layer(layer_idx, k_cache, v_cache)
+            layer_data.append(layer_bytes)
+
+        # Combine
+        all_data = [header, metadata_bytes] + layer_data
+        combined = b''.join(all_data)
+
+        # Compress if configured
+        if self.config.compress:
+            combined = self.compressor.compress(combined)
+
+        return combined
+
+    def _serialize_layer(
+        self,
+        layer_idx: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> bytes:
+        """
+        Serialize a single layer's KV cache.
+
+        Uses Apache Arrow format for efficiency.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        # Convert tensors to Arrow arrays
+        k_array = self._tensor_to_arrow(k_cache)
+        v_array = self._tensor_to_arrow(v_cache)
+
+        # Create record batch
+        batch = pa.record_batch([
+            pa.array([layer_idx], type=pa.int32()),
+            k_array,
+            v_array,
+        ], names=['layer_idx', 'k_cache', 'v_cache'])
+
+        # Write to buffer
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, batch.schema)
+        writer.write_batch(batch)
+        writer.close()
+
+        return sink.getvalue().to_pybytes()
+
+    def _tensor_to_arrow(self, tensor: torch.Tensor) -> pa.Array:
+        """Convert PyTorch tensor to Arrow array efficiently."""
+        # Get numpy array
+        if tensor.is_cuda:
+            numpy_array = tensor.cpu().numpy()
+        else:
+            numpy_array = tensor.numpy()
+
+        # Convert to Arrow
+        # Use proper dtype mapping
+        dtype_map = {
+            torch.float16: pa.float16(),
+            torch.float32: pa.float32(),
+            torch.int32: pa.int32(),
+        }
+
+        arrow_type = dtype_map.get(tensor.dtype, pa.float32())
+
+        return pa.array(numpy_array.flatten(), type=arrow_type)
+
+    def deserialize_cache(self, data: bytes) -> Tuple[List, CacheMetadata]:
+        """
+        Deserialize bytes back to KV cache.
+        """
+        # Decompress if needed
+        if self.config.compress:
+            data = self.compressor.decompress(data)
+
+        # Parse header
+        header = self._parse_header(data)
+
+        # Parse metadata
+        metadata_offset = header.metadata_offset
+        metadata_size = header.metadata_size
+        metadata_bytes = data[metadata_offset:metadata_offset + metadata_size]
+        metadata = self._deserialize_metadata(metadata_bytes)
+
+        # Parse each layer
+        kv_cache = []
+        for layer_idx in range(metadata.num_layers):
+            layer_offset = header.layer_offsets[layer_idx]
+            layer_size = header.layer_sizes[layer_idx]
+            layer_bytes = data[layer_offset:layer_offset + layer_size]
+
+            k_cache, v_cache = self._deserialize_layer(layer_bytes)
+            kv_cache.append((k_cache, v_cache))
+
+        return kv_cache, metadata
+
+class CacheMetadata:
+    """Metadata for serialized cache."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        head_size: int,
+        block_size: int,
+        dtype: str,
+        seq_len: int,
+        batch_size: int,
+        model_name: str,
+        created_at: float,
+        ttl: float,
+    ):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.block_size = block_size
+        self.dtype = dtype
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.model_name = model_name
+        self.created_at = created_at
+        self.ttl = ttl
+
+```
+
+**6.6.2 Distributed Scheduler**
+
+```python
+# Distributed scheduler for disaggregated system
+
+class DistributedScheduler:
+    """
+    Scheduler that coordinates across prefill and decode clusters.
+
+    Based on Google Borg/Omega scheduler design.
+    """
+
+    def __init__(self, config: DistributedSchedulerConfig):
+        self.config = config
+
+        # Cluster state
+        self.prefill_nodes: Dict[str, PrefillNodeState] = {}
+        self.decode_nodes: Dict[str, DecodeNodeState] = {}
+        self.cache_stores: Dict[str, CacheStoreState] = {}
+
+        # Request tracking
+        self.requests: Dict[str, RequestState] = {}
+        self.request_queue: PriorityQueue = PriorityQueue()
+
+        # Load balancer
+        self.load_balancer = LoadBalancer(config.load_balancing_strategy)
+
+        # Failure detector
+        self.failure_detector = FailureDetector(config.failure_detection_config)
+
+    def schedule_request(self, request: Request) -> ScheduleDecision:
+        """
+        Schedule a request across the disaggregated system.
+        """
+        # 1. Choose prefill node
+        prefill_node = self._select_prefill_node(request)
+
+        if not prefill_node:
+            return ScheduleDecision(
+                success=False,
+                error="No available prefill nodes",
+            )
+
+        # 2. Choose cache store
+        cache_store = self._select_cache_store(request, prefill_node)
+
+        if not cache_store:
+            return ScheduleDecision(
+                success=False,
+                error="No available cache stores",
+            )
+
+        # 3. Reserve decode node(s) for later
+        # We don't assign decode node yet, but we reserve capacity
+        decode_capacity = self._reserve_decode_capacity(request)
+
+        if not decode_capacity:
+            return ScheduleDecision(
+                success=False,
+                error="Insufficient decode capacity",
+            )
+
+        # 4. Create schedule
+        schedule = Schedule(
+            request_id=request.request_id,
+            prefill_node=prefill_node,
+            cache_store=cache_store,
+            reserved_decode_capacity=decode_capacity,
+            estimated_start_time=time.time(),
+            estimated_completion_time=self._estimate_completion_time(request),
+        )
+
+        # 5. Update state
+        self.requests[request.request_id] = RequestState(
+            request=request,
+            schedule=schedule,
+            state=RequestState.SCHEDULED,
+        )
+
+        # 6. Send to prefill node
+        self._send_to_prefill(prefill_node, request, cache_store)
+
+        return ScheduleDecision(
+            success=True,
+            schedule=schedule,
+        )
+
+    def _select_prefill_node(self, request: Request) -> Optional[str]:
+        """
+        Select prefill node using one of several strategies.
+        """
+        strategy = self.config.prefill_selection_strategy
+
+        if strategy == SelectionStrategy.LEAST_LOADED:
+            return self._select_least_loaded_prefill()
+        elif strategy == SelectionStrategy.ROUND_ROBIN:
+            return self._select_round_robin_prefill()
+        elif strategy == SelectionStrategy.POWER_OF_TWO:
+            return self._select_power_of_two_prefill()
+        elif strategy == SelectionStrategy.LOCALITY_AWARE:
+            return self._select_locality_aware_prefill(request)
+        else:
+            return self._select_random_prefill()
+
+    def _select_least_loaded_prefill(self) -> Optional[str]:
+        """Select least loaded prefill node."""
+        if not self.prefill_nodes:
+            return None
+
+        # Calculate load score for each node
+        node_scores = []
+        for node_id, node_state in self.prefill_nodes.items():
+            if not node_state.available:
+                continue
+
+            # Load based on queue length and processing time
+            queue_load = len(node_state.queue) / node_state.max_queue_size
+            processing_load = node_state.active_requests / node_state.max_requests
+
+            # Add penalty for recent failures
+            failure_penalty = node_state.recent_failures * 0.1
+
+            total_load = queue_load + processing_load + failure_penalty
+
+            node_scores.append((total_load, node_id))
+
+        if not node_scores:
+            return None
+
+        # Select node with minimum load
+        node_scores.sort()
+        return node_scores[0][1]
+
+    def _select_locality_aware_prefill(self, request: Request) -> Optional[str]:
+        """
+        Select prefill node considering data locality.
+
+        Prefers nodes that:
+        1. Have the model already loaded
+        2. Are geographically close to the user
+        3. Have low network latency to cache store
+        """
+        # Get user location from request metadata
+        user_location = request.metadata.get("user_location")
+
+        # Score each node
+        node_scores = []
+        for node_id, node_state in self.prefill_nodes.items():
+            if not node_state.available:
+                continue
+
+            score = 0.0
+
+            # Model locality (big bonus if model is loaded)
+            if request.model_name in node_state.loaded_models:
+                score += 100.0
+
+            # Geographic locality
+            if user_location and node_state.location:
+                distance = self._calculate_distance(
+                    user_location, node_state.location
+                )
+                # Lower distance = higher score
+                score += max(0, 100 - distance)
+
+            # Cache store locality
+            cache_latency = self._get_cache_latency(node_state)
+            score += max(0, 50 - cache_latency * 10)
+
+            # Current load (negative factor)
+            load_penalty = (
+                len(node_state.queue) / node_state.max_queue_size * 50 +
+                node_state.active_requests / node_state.max_requests * 50
+            )
+            score -= load_penalty
+
+            node_scores.append((score, node_id))
+
+        if not node_scores:
+            return None
+
+        # Select node with maximum score
+        node_scores.sort(reverse=True)
+        return node_scores[0][1]
+
+    def _reserve_decode_capacity(self, request: Request) -> Optional[DecodeReservation]:
+        """
+        Reserve decode capacity for future use.
+
+        Uses advance reservation since decode will happen after prefill.
+        """
+        # Estimate decode start time
+        prefill_time = self._estimate_prefill_time(request)
+        decode_start = time.time() + prefill_time + self.config.cache_transfer_time
+
+        # Calculate required decode resources
+        required_gpus = math.ceil(
+            request.estimated_output_len / self.config.tokens_per_gpu_per_second
+        )
+
+        # Find nodes that will have capacity at decode_start
+        available_nodes = []
+        for node_id, node_state in self.decode_nodes.items():
+            if not node_state.available:
+                continue
+
+            # Check if node will have capacity at decode_start
+            future_capacity = self._predict_future_capacity(
+                node_state, decode_start
+            )
+
+            if future_capacity >= required_gpus:
+                available_nodes.append((future_capacity, node_id))
+
+        if not available_nodes:
+            return None
+
+        # Select best node
+        available_nodes.sort(reverse=True)
+        selected_node = available_nodes[0][1]
+
+        # Create reservation
+        reservation = DecodeReservation(
+            node_id=selected_node,
+            gpus_reserved=required_gpus,
+            reservation_time=decode_start,
+            duration=request.estimated_output_len / self.config.tokens_per_gpu_per_second,
+            request_id=request.request_id,
+        )
+
+        # Add to node's reservations
+        self.decode_nodes[selected_node].reservations.append(reservation)
+
+        return reservation
+
+    def _predict_future_capacity(
+        self,
+        node_state: DecodeNodeState,
+        future_time: float,
+    ) -> int:
+        """
+        Predict available capacity at a future time.
+        """
+        current_capacity = node_state.total_gpus - node_state.used_gpus
+
+        # Subtract reservations that will be active
+        for reservation in node_state.reservations:
+            if (reservation.reservation_time <= future_time <=
+                reservation.reservation_time + reservation.duration):
+                current_capacity -= reservation.gpus_reserved
+
+        # Consider requests that might finish
+        # Simple estimation: assume linear completion
+        time_from_now = future_time - time.time()
+        estimated_completions = min(
+            node_state.active_requests,
+            int(time_from_now / self.config.avg_decode_time_per_token)
+        )
+
+        current_capacity += estimated_completions
+
+        return max(0, current_capacity)
+
+```
+
+**6.6.3 Failure Recovery System**
+
+```python
+# Failure recovery for disaggregated system
+
+class FailureRecoverySystem:
+    """
+    Handles failures in disaggregated architecture.
+
+    Implements:
+    - Failure detection
+    - Automatic recovery
+    - State reconciliation
+    - Graceful degradation
+    """
+
+    def __init__(self, config: RecoveryConfig):
+        self.config = config
+
+        # Failure detectors
+        self.node_detector = NodeFailureDetector(config.node_detection)
+        self.network_detector = NetworkFailureDetector(config.network_detection)
+        self.cache_detector = CacheFailureDetector(config.cache_detection)
+
+        # Recovery strategies
+        self.recovery_strategies = {
+            FailureType.NODE_FAILURE: self._recover_node_failure,
+            FailureType.NETWORK_PARTITION: self._recover_network_partition,
+            FailureType.CACHE_FAILURE: self._recover_cache_failure,
+            FailureType.TIMEOUT: self._recover_timeout,
+        }
+
+        # State manager for recovery
+        self.state_manager = RecoveryStateManager()
+
+        # Backup systems
+        self.backup_nodes = BackupNodePool(config.backup_pool_size)
+        self.cache_replicas = CacheReplicaManager(config.cache_replication_factor)
+
+    def handle_failure(self, failure: FailureEvent) -> RecoveryResult:
+        """
+        Handle a failure event.
+        """
+        # Log failure
+        self._log_failure(failure)
+
+        # Get recovery strategy
+        recovery_fn = self.recovery_strategies.get(failure.failure_type)
+        if not recovery_fn:
+            return RecoveryResult(
+                success=False,
+                error=f"No recovery strategy for {failure.failure_type}",
+            )
+
+        # Execute recovery
+        try:
+            result = recovery_fn(failure)
+
+            # Update metrics
+            self._update_recovery_metrics(result)
+
+            return result
+        except Exception as e:
+            # Fallback to graceful degradation
+            return self._graceful_degradation(failure, e)
+
+    def _recover_node_failure(self, failure: NodeFailureEvent) -> RecoveryResult:
+        """
+        Recover from node failure.
+        """
+        failed_node = failure.node_id
+        node_type = failure.node_type
+
+        # 1. Mark node as failed
+        self.state_manager.mark_node_failed(failed_node, node_type)
+
+        # 2. Find affected requests
+        affected_requests = self._find_affected_requests(failed_node, node_type)
+
+        # 3. Select recovery strategy based on node type
+        if node_type == NodeType.PREFILL:
+            return self._recover_prefill_node(failed_node, affected_requests)
+        elif node_type == NodeType.DECODE:
+            return self._recover_decode_node(failed_node, affected_requests)
+        else:
+            return self._recover_generic_node(failed_node, affected_requests)
+
+    def _recover_prefill_node(
+        self,
+        failed_node: str,
+        affected_requests: List[RequestState],
+    ) -> RecoveryResult:
+        """
+        Recover prefill node failure.
+        """
+        # 1. Get backup node
+        backup_node = self.backup_nodes.acquire_prefill_node()
+        if not backup_node:
+            return RecoveryResult(
+                success=False,
+                error="No backup prefill nodes available",
+            )
+
+        # 2. Restore requests
+        recovered_requests = []
+        failed_requests = []
+
+        for request_state in affected_requests:
+            if request_state.state == RequestState.PREFILL_IN_PROGRESS:
+                # Prefill was in progress, need to restart
+                success = self._restart_prefill(
+                    request_state.request,
+                    backup_node,
+                )
+
+                if success:
+                    recovered_requests.append(request_state.request.request_id)
+                else:
+                    failed_requests.append(request_state.request.request_id)
+            elif request_state.state == RequestState.PREFILL_COMPLETE:
+                # Prefill was complete, cache should be in store
+                # Just need to update metadata
+                success = self._update_cache_ownership(
+                    request_state.request.request_id,
+                    failed_node,
+                    backup_node,
+                )
+
+                if success:
+                    recovered_requests.append(request_state.request.request_id)
+                else:
+                    failed_requests.append(request_state.request.request_id)
+
+        # 3. Update routing
+        self._update_routing_table(failed_node, backup_node)
+
+        return RecoveryResult(
+            success=True,
+            recovered_requests=recovered_requests,
+            failed_requests=failed_requests,
+            backup_node=backup_node,
+            action_taken="Failed prefill node replaced with backup",
+        )
+
+    def _recover_decode_node(
+        self,
+        failed_node: str,
+        affected_requests: List[RequestState],
+    ) -> RecoveryResult:
+        """
+        Recover decode node failure.
+
+        More complex than prefill because decode has state
+        (partial generation in progress).
+        """
+        # Group requests by state
+        requests_by_state = defaultdict(list)
+        for req_state in affected_requests:
+            requests_by_state[req_state.state].append(req_state)
+
+        # Handle each state differently
+        recovered_requests = []
+        failed_requests = []
+
+        # 1. Requests waiting for decode (not started yet)
+        waiting_requests = requests_by_state.get(RequestState.WAITING_FOR_DECODE, [])
+        for req_state in waiting_requests:
+            # Can be rescheduled to any decode node
+            backup_node = self.backup_nodes.acquire_decode_node()
+            if backup_node:
+                success = self._reschedule_decode(
+                    req_state.request,
+                    backup_node,
+                )
+                if success:
+                    recovered_requests.append(req_state.request.request_id)
+                else:
+                    failed_requests.append(req_state.request.request_id)
+            else:
+                failed_requests.append(req_state.request.request_id)
+
+        # 2. Requests in decode progress (hardest case)
+        in_progress_requests = requests_by_state.get(RequestState.DECODE_IN_PROGRESS, [])
+        for req_state in in_progress_requests:
+            # Try to recover generation state
+            success = self._recover_decode_state(req_state)
+            if success:
+                recovered_requests.append(req_state.request.request_id)
+            else:
+                failed_requests.append(req_state.request.request_id)
+
+        # 3. Update routing
+        self._update_routing_table(failed_node, None)  # No direct replacement
+
+        return RecoveryResult(
+            success=len(recovered_requests) > 0,
+            recovered_requests=recovered_requests,
+            failed_requests=failed_requests,
+            backup_node=None,  # Multiple backup nodes may be used
+            action_taken="Failed decode node handled with state recovery",
+        )
+
+    def _recover_decode_state(self, request_state: RequestState) -> bool:
+        """
+        Attempt to recover decode state.
+
+        This is challenging because decode has incremental state.
+        Options:
+        1. Restart from last saved checkpoint
+        2. Use speculative execution to catch up
+        3. Return partial results to user
+        """
+        request_id = request_state.request.request_id
+
+        # Try to get last checkpoint
+        checkpoint = self.state_manager.get_last_checkpoint(request_id)
+
+        if checkpoint:
+            # Restart from checkpoint
+            return self._restart_from_checkpoint(request_state, checkpoint)
+
+        # No checkpoint, try to recover from cache
+        cache_state = self._recover_cache_state(request_id)
+        if cache_state:
+            # We have KV cache but not generation state
+            # Could use speculative decoding to regenerate
+            return self._speculative_recovery(request_state, cache_state)
+
+        # Last resort: return partial results
+        return self._return_partial_results(request_state)
+
+    def _recover_network_partition(
+        self,
+        failure: NetworkFailureEvent,
+    ) -> RecoveryResult:
+        """
+        Recover from network partition.
+
+        Uses techniques from distributed systems:
+        - Quorum-based decision making
+        - Hinted handoff
+        - Read repair
+        - Merkle trees for consistency
+        """
+        # 1. Detect partition boundaries
+        partitions = self.network_detector.detect_partitions()
+
+        # 2. Determine which partition has quorum
+        quorum_partition = self._find_quorum_partition(partitions)
+
+        # 3. For each non-quorum partition
+        recovered_operations = []
+        for partition in partitions:
+            if partition == quorum_partition:
+                continue
+
+            # Operations in this partition may be stale
+            stale_ops = self._get_stale_operations(partition)
+
+            # Try to reconcile
+            for op in stale_ops:
+                if self._can_reconcile_operation(op, quorum_partition):
+                    success = self._reconcile_operation(op)
+                    if success:
+                        recovered_operations.append(op)
+
+        # 4. When network heals, sync state
+        self._schedule_partition_healing(partitions)
+
+        return RecoveryResult(
+            success=True,
+            recovered_operations=len(recovered_operations),
+            action_taken=f"Network partition handled, {len(recovered_operations)} ops recovered",
+        )
+
+    def _graceful_degradation(
+        self,
+        failure: FailureEvent,
+        error: Exception,
+    ) -> RecoveryResult:
+        """
+        Graceful degradation when recovery fails.
+
+        Options:
+        1. Return partial results
+        2. Suggest retry
+        3. Switch to degraded mode
+        4. Inform user of issue
+        """
+        # Log for debugging
+        self._log_graceful_degradation(failure, error)
+
+        # Determine best degradation strategy
+        if failure.failure_type == FailureType.NODE_FAILURE:
+            # For node failure, try to redirect to other nodes
+            # with reduced service level
+            return self._degrade_service_level(failure)
+        elif failure.failure_type == FailureType.TIMEOUT:
+            # For timeout, return partial results if available
+            return self._return_partial_on_timeout(failure)
+        else:
+            # Generic degradation
+            return RecoveryResult(
+                success=False,
+                error=str(error),
+                action_taken="Service degraded, please retry",
+                degraded_mode=True,
+            )
+
+    def _degrade_service_level(self, failure: FailureEvent) -> RecoveryResult:
+        """
+        Degrade service level to maintain availability.
+
+        Example degradations:
+        - Switch to smaller/faster model
+        - Reduce output quality
+        - Increase latency tolerance
+        - Batch more aggressively
+        """
+        affected_requests = self._find_affected_requests(
+            failure.node_id, failure.node_type
+        )
+
+        degraded_requests = []
+        for req_state in affected_requests:
+            # Check if request can be degraded
+            if self._can_degrade_request(req_state.request):
+                # Apply degradation
+                degraded_request = self._apply_degradation(req_state.request)
+
+                # Reschedule
+                success = self._reschedule_degraded(degraded_request)
+                if success:
+                    degraded_requests.append(degraded_request.request_id)
+
+        return RecoveryResult(
+            success=len(degraded_requests) > 0,
+            degraded_requests=degraded_requests,
+            action_taken=f"Service degraded for {len(degraded_requests)} requests",
+            degraded_mode=True,
+        )
+
+```
+
+This comprehensive guide covers LLM inference from first principles to production-grade distributed systems. The content is structured to build understanding progressively, with each section adding depth and complexity. The diagrams provide visual explanations of key concepts, while the code examples show real implementations from major inference engines.
+<<<<<<< HEAD
+
 
 ---
 
 **Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
+=======
+>>>>>>> 57e4acfce6a6405a52387912827e6cd59e36380b
