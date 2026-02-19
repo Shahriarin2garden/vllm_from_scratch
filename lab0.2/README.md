@@ -100,7 +100,8 @@ Because each probability depends on all previous tokens, we cannot compute token
 <summary>Click to review</summary>
 
 During training, the entire correct sequence is available, so the model can compute all positions simultaneously using a causal mask. During inference, you don’t know the future tokens; each step’s output depends on the previous step’s sampled token. This creates a data dependency that forces sequential generation.
-    
+
+</details>
 
 ### 1.3 Computational Graph Decomposition
 
@@ -144,7 +145,8 @@ The KV cache eliminates redundant computation, reducing total cost from $O(T^2)$
 <summary>Click to calculate</summary>
 
 Each token produces a key and a value vector per layer. For each layer: $2 \times 4096 \times 2$ bytes = 16 KB per token (key + value). For 32 layers: $32 \times 16$ KB = 512 KB per token. For 1000 tokens: 512 MB.
-    
+
+</details>
 
 ### 1.5 GPT Inference Process Diagram
 
@@ -287,9 +289,10 @@ The diagram below illustrates the two-phase inference engine with modern optimiz
 <summary>Click to verify</summary>
 
 Cache size per token = 32 layers × 2 (key+value) × 4096 × 2 bytes = 32 × 2 × 4096 × 2 = 524,288 bytes ≈ 0.5 MB.
-    
-    For 2048 tokens: 2048 × 0.5 MB = 1024 MB = 1 GB.
-    
+
+For 2048 tokens: 2048 × 0.5 MB = 1024 MB = 1 GB.
+
+</details>
 
 ### 1.13 Checkpoint
 
@@ -320,7 +323,8 @@ The prefill phase processes the user’s prompt in one shot. Because the entire 
 <summary>Click to review</summary>
 
 Prefill has all tokens available simultaneously, so it can compute attention scores for all positions in parallel using matrix multiplication. Decode must compute one token at a time because each new token depends on the previous one.
-    
+
+</details>
 
 ### 2.3 Prefill Phase Data Flow Diagram
 
@@ -598,7 +602,8 @@ graph TD
 <summary>Click to verify</summary>
 
 Compute‑bound. Arithmetic intensity ~ $S$ = 512, which is well above 100. The GPU will spend most of its time computing, not waiting for memory.
-    
+
+</details>
 
 ### 2.14 Experiment: Measure Arithmetic Intensity
 
@@ -898,7 +903,8 @@ graph LR
 <summary>Click to verify</summary>
 
 The time per step increases slightly because the KV cache grows, so more data must be read from memory each time. However, the increase is sublinear because the attention computation is $O(t \cdot d)$ and memory movement is $O(t \cdot d)$ as well. The dominating factor is still the model weights, so the increase may be modest.
-    
+
+</details>
 
 ### 3.10 Checkpoint
 
@@ -1023,8 +1029,6 @@ class Request:
         self.state = 'prefill'   # or 'decode'
         self.done = False
 
-</details>
-
 class Scheduler:
     def __init__(self, token_budget):
         self.budget = token_budget
@@ -1083,7 +1087,8 @@ Different frameworks implement continuous batching with variations [12,13,14]:
 <summary>Click to verify</summary>
 
 It depends on scheduling policy. If you prioritize prefill first, B’s prefill (10 tokens) may be scheduled immediately, then A’s prefill might be chunked. B will likely finish first because its short prompt allows it to enter decode quickly, and decode steps are cheap.
-    
+
+</details>
 
 ### 4.10 Checkpoint
 
@@ -1115,9 +1120,10 @@ Modern inference systems employ several advanced techniques to further optimize 
 <summary>Click to calculate</summary>
 
 Without prefix caching: each user stores the full KV cache (1 GB) = 500 GB total.
-    
-    With prefix caching: the system prompt’s KV cache (10 MB) is stored once and shared. Each user only stores their unique conversation after the prompt. If average conversation length is 1000 tokens, each user’s unique cache is 1 GB - 10 MB = 990 MB. Total = 10 MB + 500 × 990 MB ≈ 10 MB + 495 GB ≈ 495 GB. Saving = 5 GB. The saving grows with the number of users.
-    
+
+With prefix caching: the system prompt’s KV cache (10 MB) is stored once and shared. Each user only stores their unique conversation after the prompt. If average conversation length is 1000 tokens, each user’s unique cache is 1 GB - 10 MB = 990 MB. Total = 10 MB + 500 × 990 MB ≈ 10 MB + 495 GB ≈ 495 GB. Saving = 5 GB. The saving grows with the number of users.
+
+</details>
 
 ### 5.3 Chunked Prefill (Chunked Context)
 
@@ -1480,8 +1486,6 @@ Your mental model of LLM serving now includes the critical trade‑offs that eng
     2. **Prefix caching:** Reuses KV cache for common prefixes (e.g., system prompts) across requests to save memory.
     3. **Speculative decoding:** Uses a draft model to propose multiple tokens, verified in parallel by the target model, reducing latency.
 
-</details>
-
 ---
 
 ## Additional Resources
@@ -1513,3 +1517,4 @@ Your mental model of LLM serving now includes the critical trade‑offs that eng
 ---
 
 **Navigation:** [← Lab 0.1](../lab0.1/README.md) | [Main](../README.md) | [Next: Lab 0.3 →](../lab0.3/README.md)
+
