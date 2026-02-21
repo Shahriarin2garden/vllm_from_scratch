@@ -81,7 +81,8 @@ Every LLM is trained to predict the next token given the previous ones. During i
 graph LR
     A[Token 1] --> B[Model] --> C[Token 2]
     C --> D[Model] --> E[Token 3]
-    E --> F[...]
+    E --> F[Model] --> G[Token 4]
+    G --> H[...]
 ```
 
 The probability of a whole sequence is the product of conditional probabilities, as established in the foundational Transformer paper “Attention Is All You Need” [1]:
@@ -117,14 +118,16 @@ where $K_{1:t-1}, V_{1:t-1}$ are the key and value vectors from all previous tok
 graph TB
     subgraph WithoutCache["Without Cache - O(T²) complexity"]
         A1[Step 1] --> B1[Compute K1,V1]
-        A2[Step 2] --> B2[Compute K1,V1 + K2,V2]
-        A3[Step 3] --> B3[Compute K1,V1 + K2,V2 + K3,V3]
+        A2[Step 2] --> B2["Recompute K1,V1<br/>Compute K2,V2"]
+        A3[Step 3] --> B3["Recompute K1,V1,K2,V2<br/>Compute K3,V3"]
+        A4[Step T] --> B4["Recompute all K1..KT-1,V1..VT-1<br/>Compute KT,VT"]
     end
     
     subgraph WithCache["With Cache - O(T) complexity"]
-        C1[Step 1] --> D1[Compute & Store K1,V1]
-        C2[Step 2] --> D2[Read K1,V1<br/>Compute & Store K2,V2]
-        C3[Step 3] --> D3[Read K1,V1,K2,V2<br/>Compute & Store K3,V3]
+        C1[Step 1] --> D1["Compute & Store K1,V1"]
+        C2[Step 2] --> D2["Read K1,V1<br/>Compute & Store K2,V2"]
+        C3[Step 3] --> D3["Read K1,V1,K2,V2<br/>Compute & Store K3,V3"]
+        C4[Step T] --> D4["Read cached K1..KT-1,V1..VT-1<br/>Compute & Store KT,VT"]
     end
 ```
 
@@ -182,9 +185,9 @@ The following diagram from the PagedAttention paper shows how memory is allocate
 
 ```mermaid
 pie title "A100 GPU Memory Allocation for 13B Model Inference"
-    "Model Parameters" : 65
-    "KV Cache" : 30
-    "Activations & Other" : 5
+    "Model Parameters (65%)" : 65
+    "KV Cache (30%)" : 30
+    "Activations & Other (5%)" : 5
 ```
 
 **Diagram Explanation:** This pie chart illustrates the memory breakdown for a 13B parameter model on an A100 GPU. Model parameters consume the majority (65%) of GPU memory and are statically allocated. The KV cache, despite being dynamically allocated based on sequence length, consumes a significant portion (30%). This highlights why efficient KV cache management is critical—it's the second-largest memory consumer and grows unpredictably with request length.
@@ -195,10 +198,11 @@ The following diagram compares vLLM's memory usage against other systems:
 
 ```mermaid
 graph TB
-    FT["FasterTransformer:<br/>Linear growth, high waste"]
-    Orca["Orca:<br/>Reduced waste, some fragmentation"]
-    vLLM["vLLM with PagedAttention:<br/>Near-optimal, minimal fragmentation"]
-    FT --> Orca --> vLLM
+    FT["FasterTransformer:<br/>Linear growth, high waste<br/>Batch size: 10-20"]
+    Orca["Orca:<br/>Reduced waste, some fragmentation<br/>Batch size: 30-40"]
+    vLLM["vLLM with PagedAttention:<br/>Near-optimal, minimal fragmentation<br/>Batch size: 80-100+"]
+    FT -->|Iteration-level batching| Orca
+    Orca -->|Block-based cache| vLLM
 ```
 
 **Diagram Explanation:** This comparison shows how different systems handle memory as batch size increases. FasterTransformer shows steep memory growth due to pre-allocation. Orca improves but suffers from fragmentation. vLLM with PagedAttention achieves near-linear scaling, enabling much larger batch sizes within the same memory budget.
@@ -226,11 +230,15 @@ The KV cache leads naturally to two phases:
 
 ```mermaid
 flowchart LR
-    Prompt --> P[Prefill Phase<br/>Parallel compute KV for prompt]
-    P --> Cache[KV Cache]
+    Prompt[User Prompt] --> P[Prefill Phase<br/>Parallel compute KV for prompt]
+    P --> Cache[KV Cache<br/>Store K1..KS, V1..VS]
     Cache --> D[Decode Phase<br/>Sequential generation]
     D --> Token[Next Token]
-    Token --> D
+    Token --> Update[Update KV Cache<br/>Append new K,V]
+    Update --> D
+    Token --> Check{Done?}
+    Check -->|No| Update
+    Check -->|Yes| Output[Complete Response]
 ```
 
 ### 1.11 Architecture Diagram
@@ -293,15 +301,17 @@ The following diagram from FlashInfer documentation illustrates the prefill phas
 ```mermaid
 graph TD
     subgraph "Prefill Phase: Multiple Query Tokens"
-        Q["Query: qo_len x num_heads x head_dim"]
-        K["Key: kv_len x num_heads x head_dim"]
-        V["Value: kv_len x num_heads x head_dim"]
-        Q --> Attn["Attention Computation"]
+        Input["Input Prompt: S tokens"]
+        Input --> Q["Query: qo_len x num_heads x head_dim"]
+        Input --> K["Key: kv_len x num_heads x head_dim"]
+        Input --> V["Value: kv_len x num_heads x head_dim"]
+        Q --> Attn["Attention Computation<br/>All tokens in parallel"]
         K --> Attn
         V --> Attn
-        Attn --> Mask["Causal Masking"]
-        Mask --> Out["Output: qo_len x num_heads x head_dim"]
-        Out --> KVCache["Populate KV Cache"]
+        Attn --> Mask["Causal Masking<br/>Token i attends to 0..i"]
+        Mask --> Softmax["Softmax over sequence"]
+        Softmax --> Out["Output: qo_len x num_heads x head_dim"]
+        Out --> KVCache["Populate KV Cache<br/>Store all K,V for future decode"]
     end
 ```
 
@@ -323,14 +333,16 @@ For a prompt of length $S$:
 ```mermaid
 graph TD
     subgraph AttentionComputation
-        A[Q: S×d] --> M1[MatMul Q×K transpose]
-        B[K: S×d] --> M1
-        M1 --> S[Scores: S×S]
-        S --> SM[Softmax]
-        SM --> P[Probs: S×S]
-        P --> M2[MatMul P×V]
-        C[V: S×d] --> M2
-        M2 --> O[Output: S×d]
+        A["Q: S×d<br/>(Query matrix)"] --> M1["MatMul Q×K^T<br/>O(S²·d) FLOPs"]
+        B["K: S×d<br/>(Key matrix)"] --> M1
+        M1 --> Sc["Scores: S×S<br/>(Attention scores)"]
+        Sc --> Scale["Scale by 1/√d"]
+        Scale --> Mask["Apply causal mask"]
+        Mask --> SM["Softmax<br/>Normalize per row"]
+        SM --> P["Probs: S×S<br/>(Attention weights)"]
+        P --> M2["MatMul P×V<br/>O(S²·d) FLOPs"]
+        C["V: S×d<br/>(Value matrix)"] --> M2
+        M2 --> O["Output: S×d<br/>(Contextualized)"] 
     end
 ```
 
@@ -340,15 +352,24 @@ The following diagram illustrates the architecture of FlashInfer's prefill kerne
 
 ```mermaid
 graph TD
-    TB[Thread Block] --> Warp1["Warp 1: Process query rows 0-15"]
-    TB --> Warp2["Warp 2: Process query rows 16-31"]
-    TB --> WarpN["Warp N: Process query rows ..."]
+    subgraph ThreadOrganization["Thread Block Organization"]
+        TB["Thread Block<br/>(CTA_TILE_Q rows)"]
+        TB --> Warp1["Warp 1: Process query rows 0-15"]
+        TB --> Warp2["Warp 2: Process query rows 16-31"]
+        TB --> Warp3["Warp 3: Process query rows 32-47"]
+        TB --> WarpN["Warp N: Process query rows ..."]
+    end
     
-    S1["Stage 1: Load Q tile to SRAM"] --> S2["Stage 2: Async load K,V tile"]
-    S2 --> S3["Stage 3: Compute QK transpose"]
-    S3 --> S4["Stage 4: Causal mask + softmax"]
-    S4 --> S5["Stage 5: Compute output with V"]
-    S5 --> S6["Stage 6: Update attention state"]
+    subgraph Pipeline["6-Stage Pipelined Execution"]
+        S1["Stage 1: Load Q tile to SRAM<br/>(Shared memory)"] --> S2["Stage 2: Async load K,V tile<br/>(cp.async PTX instruction)"]
+        S2 --> S3["Stage 3: Compute QK^T<br/>(mma.sync tensor cores)"]
+        S3 --> S4["Stage 4: Causal mask + softmax<br/>(Online softmax algorithm)"]
+        S4 --> S5["Stage 5: Compute output with V<br/>(Attention x Values)"]
+        S5 --> S6["Stage 6: Update attention state<br/>(Merge running statistics)"]
+        S6 --> NextTile{"More KV tiles?"}
+        NextTile -->|Yes| S2
+        NextTile -->|No| Done["Write output to HBM"]
+    end
 ```
 
 **Diagram Explanation:** This diagram shows the thread block organization in FlashInfer's prefill kernel. Each thread block processes a tile of query rows (`CTA_TILE_Q`) and a tile of KV columns (`CTA_TILE_KV`). Warps within the block distribute the query rows. The kernel operates in six stages: loading query data to shared memory, asynchronously loading key/value tiles, computing QK multiplication using tensor core `mma_sync` instructions, applying causal masking and softmax, computing the output with value tensors, and updating the attention state with online softmax statistics.
@@ -359,10 +380,10 @@ Total FLOPs ≈ $2 N S \left(1 + \frac{S}{d_{\text{model}}}\right)$, where $N$ i
 
 ```mermaid
 pie title Prefill FLOPs Distribution
-    "QKV Projections" : 40
-    "Attention Scores (QK^T)" : 30
-    "Softmax" : 5
-    "Attention Apply (score·V)" : 25
+    "QKV Projections (40%)" : 40
+    "Attention Scores QK^T (30%)" : 30
+    "Softmax (5%)" : 5
+    "Attention Apply score·V (25%)" : 25
 ```
 
 ### 2.7 Memory Hierarchy During Prefill
@@ -371,12 +392,14 @@ Modern GPUs have a complex memory hierarchy. Understanding it is key to optimizi
 
 ```mermaid
 flowchart TD
-    W[Model Weights] --> L2
-    IO[Activations] --> L2
-    L2["L2 Cache ~40MB<br/>Bandwidth: 4-8 TB/s"] --> L1
-    L1["L1/SRAM ~10-20MB per SM<br/>Bandwidth: 10-20 TB/s"] --> Reg[Register File]
-    Reg --> TCU["Tensor Cores<br/>Compute: 312 TFLOPS FP16"]
-    Reg --> FPU[FP32 Units]
+    HBM["HBM Memory<br/>~40-80GB<br/>Bandwidth: 1.5-2 TB/s"] --> W["Model Weights<br/>(14 GB for 7B model)"]
+    HBM --> IO["Activations<br/>(Temporary tensors)"]
+    W --> L2
+    IO --> L2
+    L2["L2 Cache ~40MB<br/>Bandwidth: 4-8 TB/s<br/>Shared across SMs"] --> L1
+    L1["L1/SRAM ~10-20MB per SM<br/>Bandwidth: 10-20 TB/s<br/>Per-SM cache"] --> Reg["Register File<br/>~256KB per SM<br/>Ultra-fast access"]
+    Reg --> TCU["Tensor Cores<br/>Compute: 312 TFLOPS FP16<br/>For matrix operations"]
+    Reg --> FPU["FP32/CUDA Cores<br/>For element-wise ops"]
 ```
 
 **Arithmetic intensity** = total FLOPs / total bytes moved. For prefill, it is proportional to $S$, so for typical prompts ($S > 100$) it exceeds the GPU’s ops:byte ratio, making it compute‑bound.
@@ -387,17 +410,23 @@ The following diagram illustrates tiled attention computation used in FlashAtten
 
 ```mermaid
 graph TD
-    subgraph "Tiled Matrix Multiplication"
-        QTile["Q Tile (Br × d)"]
-        KTile["K Tile (Bc × d)"]
-        VTile["V Tile (Bc × d)"]
-        QTile --> QK["Compute QK transpose<br/>(Br × Bc)"]
+    subgraph "Tiled Matrix Multiplication - FlashAttention Algorithm"
+        direction TB
+        LoadQ["Load Q Tile (Br × d)<br/>to SRAM"] --> QTile["Q in SRAM"]
+        LoadK["Load K Tile (Bc × d)<br/>to SRAM"] --> KTile["K in SRAM"]
+        LoadV["Load V Tile (Bc × d)<br/>to SRAM"] --> VTile["V in SRAM"]
+        QTile --> QK["Compute QK^T<br/>(Br × Bc) in SRAM"]
         KTile --> QK
-        QK --> SM["Softmax Statistics<br/>(running max, sum)"]
-        SM --> Attn["Attention Scores<br/>(Br × Bc)"]
-        Attn --> Out["Partial Output<br/>(Br × d)"]
-        VTile --> Out
-        Out --> Merge["Merge with running output"]
+        QK --> Scale["Scale & Mask<br/>in SRAM"]
+        Scale --> SM["Online Softmax<br/>Update running max, sum"]
+        SM --> Attn["Attention Scores<br/>(Br × Bc) in SRAM"]
+        Attn --> Mult["Multiply with V<br/>in SRAM"]
+        VTile --> Mult
+        Mult --> Out["Partial Output (Br × d)"]
+        Out --> Merge["Merge with running output<br/>Renormalize using stats"]
+        Merge --> Loop{"More tiles?"}
+        Loop -->|Yes| LoadK
+        Loop -->|No| Final["Write final output to HBM"]
     end
 ```
 
@@ -408,20 +437,32 @@ graph TD
 FlashAttention, introduced by Dao et al. (2022) [3], is an IO-aware exact attention algorithm that uses tiling to reduce memory reads/writes. It achieves 2-4× speedup compared to PyTorch standard attention.
 
 ```mermaid
-graph LR
-    SA1["Standard Attention:<br/>Load Q,K,V from HBM"] --> SA2[Compute S]
-    SA2 --> SA3[Write S to HBM]
-    SA3 --> SA4[Load S from HBM]
-    SA4 --> SA5[Compute softmax]
-    SA5 --> SA6[Write P to HBM]
-    SA6 --> SA7[Load P from HBM]
-    SA7 --> SA8[Compute output]
-    SA8 --> SA9[Write O to HBM]
+graph TB
+    subgraph StandardAttention["Standard Attention - Multiple HBM Accesses"]
+        SA1["1. Load Q,K,V from HBM<br/>(3 reads)"]
+        SA1 --> SA2["2. Compute S = QK^T<br/>(in registers)"]
+        SA2 --> SA3["3. Write S to HBM<br/>(1 write, S×S matrix)"]
+        SA3 --> SA4["4. Load S from HBM<br/>(1 read)"]
+        SA4 --> SA5["5. Compute softmax(S)<br/>(in registers)"]
+        SA5 --> SA6["6. Write P to HBM<br/>(1 write, S×S matrix)"]
+        SA6 --> SA7["7. Load P from HBM<br/>(1 read)"]
+        SA7 --> SA8["8. Compute O = PV<br/>(in registers)"]
+        SA8 --> SA9["9. Write O to HBM<br/>(1 write)"]
+        SA9 --> SATotal["Total: O(S²) memory I/O"]
+    end
     
-    FA1["FlashAttention:<br/>Load Q tile to SRAM"] --> FA2[Load K tile to SRAM]
-    FA2 --> FA3[Compute on tile]
-    FA3 --> FA4[Load V tile]
-    FA4 --> FA5[Write final O to HBM]
+    subgraph FlashAttn["FlashAttention - SRAM-Based Tiling"]
+        FA1["1. Load Q tile to SRAM"]
+        FA1 --> FA2["2. Load K tile to SRAM"]
+        FA2 --> FA3["3. Compute QK^T in SRAM"]
+        FA3 --> FA4["4. Online softmax in SRAM"]
+        FA4 --> FA5["5. Load V tile to SRAM"]
+        FA5 --> FA6["6. Compute partial output<br/>Accumulate in SRAM"]
+        FA6 --> FA7{"More tiles?"}
+        FA7 -->|Yes| FA2
+        FA7 -->|No| FA8["7. Write final O to HBM<br/>(1 write only)"]
+        FA8 --> FATotal["Total: O(S) memory I/O"]
+    end
 ```
 
 **Memory savings:** FlashAttention reduces memory footprint from quadratic to linear in sequence length. At sequence length 4K, memory savings reach 20× [3].
@@ -444,19 +485,19 @@ def naive_attention(q, k, v):
     v = v.transpose(1, 2)
 
     # Compute scores (QK^T)
-    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # Q1: What shape?
+    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # Q1: What shape? [batch, num_heads, seq_len, seq_len]
 
     # Apply causal mask
     mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
     scores = scores.masked_fill(mask, float('-inf'))
 
     # Softmax
-    attn_weights = F.softmax(scores, dim=-1)  # Q2: Which dimension?
+    attn_weights = F.softmax(scores, dim=-1)  # Q2: Which dimension? dim=-1 (over keys)
 
     # Apply to values
-    out = torch.matmul(attn_weights, v)  # Q3: What is the output shape?
+    out = torch.matmul(attn_weights, v)  # Q3: What is the output shape? [batch, num_heads, seq_len, head_dim]
 
-    return out.transpose(1, 2)
+    return out.transpose(1, 2)  # [batch, seq_len, num_heads, head_dim]
 ```
 
 - Click for solutions
@@ -480,9 +521,14 @@ def flash_attention(q, k, v):
 For more control, you can use the official FlashAttention package [4]:
 
 ```python
+# Using the official FlashAttention package for more control
 from flash_attn.flash_attention import FlashAttention
 
-flash_attn = FlashAttention()
+flash_attn = FlashAttention(
+    softmax_scale=None,  # Will use 1/sqrt(d) by default
+    attention_dropout=0.0
+)
+# q, k, v should be [batch, seq_len, num_heads, head_dim]
 output = flash_attn(q, k, v)
 ```
 
@@ -492,17 +538,23 @@ The official FlashAttention benchmarks show significant improvements across diff
 
 ```mermaid
 graph TB
-    A100["A100 GPU Speedup"]
-    A100 --> S1["Seq Len 512: 2.5x"]
-    A100 --> S2["Seq Len 1K: 3x"]
-    A100 --> S3["Seq Len 2K: 3.5x"]
-    A100 --> S4["Seq Len 4K: 4x"]
+    subgraph A100Performance["A100 GPU - FlashAttention Speedup"]
+        A100["A100 80GB"]
+        A100 --> S1["Seq Len 512: 2.5x speedup"]
+        A100 --> S2["Seq Len 1K: 3x speedup"]
+        A100 --> S3["Seq Len 2K: 3.5x speedup"]
+        A100 --> S4["Seq Len 4K: 4x speedup"]
+    end
     
-    T4GPU["T4 GPU Speedup"]
-    T4GPU --> T1["Seq Len 512: 3x"]
-    T4GPU --> T2["Seq Len 1K: 3.5x"]
-    T4GPU --> T3["Seq Len 2K: 4x"]
-    T4GPU --> T4["Seq Len 4K: 4.5x"]
+    subgraph T4Performance["T4 GPU - FlashAttention Speedup"]
+        T4GPU["T4 16GB"]
+        T4GPU --> T1["Seq Len 512: 3x speedup"]
+        T4GPU --> T2["Seq Len 1K: 3.5x speedup"]
+        T4GPU --> T3["Seq Len 2K: 4x speedup"]
+        T4GPU --> T4["Seq Len 4K: 4.5x speedup"]
+    end
+    
+    Note["Speedup increases with<br/>sequence length due to<br/>reduced HBM traffic"]
 ```
 
 ### 2.12 Multi-Query and Grouped-Query Attention
@@ -511,17 +563,28 @@ Modern models often use **Multi-Query Attention (MQA)** or **Grouped-Query Atten
 
 ```mermaid
 graph TB
-    MHA["Multi-Head Attention<br/>Each query head has own K,V"]
-    MHA --> MHA1["Q1 → K1, V1"]
-    MHA --> MHA2["Q2 → K2, V2"]
+    subgraph MHA_Diagram["Multi-Head Attention (MHA)"]
+        MHA["Each query head has own K,V<br/>Total: n_heads KV pairs"]
+        MHA --> MHA1["Q_head_1 → K1, V1"]
+        MHA --> MHA2["Q_head_2 → K2, V2"]
+        MHA --> MHA3["Q_head_3 → K3, V3"]
+        MHA --> MHA_N["Q_head_n → Kn, Vn"]
+    end
     
-    GQA["Grouped-Query Attention<br/>Query heads share K,V in groups"]
-    GQA --> GQA1["Q1 → K1, V1"]
-    GQA --> GQA2["Q2 → K1, V1"]
+    subgraph GQA_Diagram["Grouped-Query Attention (GQA)"]
+        GQA["Query heads share K,V in groups<br/>Total: n_groups KV pairs"]
+        GQA --> GQA1["Q_head_1, Q_head_2 → K1, V1"]
+        GQA --> GQA2["Q_head_3, Q_head_4 → K2, V2"]
+        GQA --> GQA_N["Q_head_n-1, Q_head_n → Kg, Vg"]
+    end
     
-    MQA["Multi-Query Attention<br/>All query heads share one K,V"]
-    MQA --> MQA1["Q1 → K, V"]
-    MQA --> MQA2["Q2 → K, V"]
+    subgraph MQA_Diagram["Multi-Query Attention (MQA)"]
+        MQA["All query heads share one K,V<br/>Total: 1 KV pair"]
+        MQA --> MQA1["Q_head_1 → K, V"]
+        MQA --> MQA2["Q_head_2 → K, V"]
+        MQA --> MQA3["Q_head_3 → K, V"]
+        MQA --> MQA_N["Q_head_n → K, V"]
+    end
 ```
 
 **Memory savings:** For Llama 2 70B (8 KV heads, 64 query heads), GQA reduces KV cache size by 8× compared to MHA.
@@ -549,18 +612,31 @@ def measure_arithmetic_intensity(model, input_ids):
     # Profile forward pass
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
-    output = model(input_ids)
+    
+    with torch.no_grad():
+        output = model(input_ids)
+    
+    torch.cuda.synchronize()  # Wait for GPU to finish
     end_time = time.time()
+    elapsed_time = end_time - start_time
 
     # Get memory stats
     memory_stats = torch.cuda.memory_stats()
     bytes_moved = memory_stats["active_bytes.all.current"]
 
     # Estimate FLOPs (simplified)
-    flops = estimate_model_flops(model, input_ids)
+    # For a transformer: roughly 2 * n_params * seq_len FLOPs
+    n_params = sum(p.numel() for p in model.parameters())
+    seq_len = input_ids.shape[1]
+    flops = 2 * n_params * seq_len
 
     arithmetic_intensity = flops / bytes_moved
-    print(f"Arithmetic Intensity:{arithmetic_intensity:.2f} FLOPs/byte")
+    print(f"Sequence Length: {seq_len}")
+    print(f"FLOPs: {flops / 1e9:.2f} GFLOPs")
+    print(f"Bytes Moved: {bytes_moved / 1e9:.2f} GB")
+    print(f"Arithmetic Intensity: {arithmetic_intensity:.2f} FLOPs/byte")
+    print(f"Time: {elapsed_time * 1000:.2f} ms")
+    
     return arithmetic_intensity
 ```
 
@@ -759,12 +835,14 @@ def decode_step(input_token, position, kv_cache, model):
     return logits, kv_cache
 ```
 
-- Click for solutions
-    
-    **Q1:** `q, k, v` each have shape `[batch, 1, num_heads, head_dim]`.
-    
-    **Q2:** Concatenate along the sequence dimension (`dim=1`), because the new token extends the sequence.
-    
+<details>
+<summary>Click for solutions</summary>
+
+**Q1:** `q, k, v` each have shape `[batch, 1, num_heads, head_dim]`.
+
+**Q2:** Concatenate along the sequence dimension (`dim=1`), because the new token extends the sequence.
+
+</details>
 
 ### 3.8 Speculative Decoding: Breaking Sequentiality
 
@@ -1290,42 +1368,54 @@ Your mental model of LLM serving now includes the critical trade‑offs that eng
 
 **Question 1:** Explain why the KV cache is necessary for efficient inference. What would happen without it?
 
-- Answer
-    
-    Without KV cache, each decode step would recompute the key and value vectors for all previous tokens, leading to $O(T^2)$ complexity. The cache stores these vectors, reducing complexity to $O(T)$ and enabling practical generation lengths.
-    
+<details>
+<summary>Answer</summary>
+
+Without KV cache, each decode step would recompute the key and value vectors for all previous tokens, leading to $O(T^2)$ complexity. The cache stores these vectors, reducing complexity to $O(T)$ and enabling practical generation lengths.
+
+</details>
 
 **Question 2:** A model has 32 layers, hidden size 5120, and uses FP16. Calculate the KV cache size for a 2048-token sequence.
 
-- Answer
-    
-    Per token per layer: 2 (key+value) × 5120 × 2 bytes = 20,480 bytes ≈ 20 KB.
-    
-    32 layers: 32 × 20 KB = 640 KB per token.
-    
-    2048 tokens: 2048 × 640 KB = 1,310,720 KB = 1.25 GB.
-    
+<details>
+<summary>Answer</summary>
+
+Per token per layer: 2 (key+value) × 5120 × 2 bytes = 20,480 bytes ≈ 20 KB.
+
+32 layers: 32 × 20 KB = 640 KB per token.
+
+2048 tokens: 2048 × 640 KB = 1,310,720 KB = 1.25 GB.
+
+</details>
 
 **Question 3:** Why is decode phase memory‑bound while prefill is compute‑bound?
 
-- Answer
-    
-    Prefill processes many tokens in parallel, performing large matrix multiplications with high arithmetic intensity. Decode processes one token at a time, but must load all model weights and the growing KV cache from memory, resulting in low arithmetic intensity (often <1 FLOP/byte). The GPU spends most of its time waiting for data movement.
-    
+<details>
+<summary>Answer</summary>
+
+Prefill processes many tokens in parallel, performing large matrix multiplications with high arithmetic intensity. Decode processes one token at a time, but must load all model weights and the growing KV cache from memory, resulting in low arithmetic intensity (often <1 FLOP/byte). The GPU spends most of its time waiting for data movement.
+
+</details>
 
 **Question 4:** What problem does PagedAttention solve? How does it work?
 
-- Answer
-    
-    PagedAttention solves memory fragmentation caused by contiguous KV cache allocation. It divides the cache into fixed-size blocks and uses a logical-to-physical mapping (block table), allowing non-contiguous storage, eliminating fragmentation, and enabling prefix sharing.
-    
+<details>
+<summary>Answer</summary>
+
+PagedAttention solves memory fragmentation caused by contiguous KV cache allocation. It divides the cache into fixed-size blocks and uses a logical-to-physical mapping (block table), allowing non-contiguous storage, eliminating fragmentation, and enabling prefix sharing.
+
+</details>
 
 **Question 5:** List three advanced techniques that improve inference performance and briefly describe each.
 
-- Answer
-    1. **Chunked prefill:** Splits long prompts into chunks interleaved with decode steps to prevent head-of-line blocking.
-    2. **Prefix caching:** Reuses KV cache for common prefixes (e.g., system prompts) across requests to save memory.
-    3. **Speculative decoding:** Uses a draft model to propose multiple tokens, verified in parallel by the target model, reducing latency.
+<details>
+<summary>Answer</summary>
+
+1. **Chunked prefill:** Splits long prompts into chunks interleaved with decode steps to prevent head-of-line blocking.
+2. **Prefix caching:** Reuses KV cache for common prefixes (e.g., system prompts) across requests to save memory.
+3. **Speculative decoding:** Uses a draft model to propose multiple tokens, verified in parallel by the target model, reducing latency.
+
+</details>
 
 ---
 
