@@ -759,7 +759,10 @@ This fragmentation limits concurrent users and wastes GPU memory [7].
 
 ```mermaid
 flowchart LR
-    T0[T0] --> T1[T1] --> T2[T2] --> T3[T3] --> T4[T4]
+    T0[T0] --> T1[T1]
+    T1 --> T2[T2]
+    T2 --> T3[T3]
+    T3 --> T4[T4]
     T4 --> Mapping[Block Table]
     Mapping --> B0["Block 0: T0, T1"]
     Mapping --> B1["Block 1: T2, T3"]
@@ -784,7 +787,8 @@ graph TD
     T0 --> K0["K even indices"]
     T1 --> K1["K odd indices"]
     
-    K0 & K1 --> Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
+    K0 --> Note["Memory coalescing:<br/>Adjacent threads read<br/>adjacent memory locations"]
+    K1 --> Note
 ```
 
 **Diagram Explanation:** This diagram shows how thread groups access memory in the PagedAttention kernel. Each thread group (2 threads in this example) handles one query token and one key token. Each thread processes a subset of elements (every other element) so that neighboring threads read neighboring memory addresses, achieving memory coalescing for better bandwidth utilization.
@@ -938,18 +942,9 @@ stateDiagram-v2
     Paused --> Decoding: resumed
     Finished --> [*]
     
-    note right of Waiting
-        Request arrives
-    end note
-    
-    note right of Paused
-        Memory pressure:
-        Swap KV cache to CPU
-    end note
-    
-    note right of Finished
-        Free resources
-    end note
+    note right of Waiting: Request arrives
+    note right of Paused: Memory pressure - Swap KV cache to CPU
+    note right of Finished: Free resources
 ```
 
 The scheduler may pause a low‑priority decode request and swap its KV cache to CPU if GPU memory is tight [7].
