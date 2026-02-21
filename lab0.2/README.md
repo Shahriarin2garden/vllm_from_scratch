@@ -929,14 +929,27 @@ graph TB
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting : Request arrives
-    Waiting --> Prefill : scheduled
-    Prefill --> Decoding : first token generated
-    Decoding --> Decoding : next token
-    Decoding --> Finished : generation complete
-    Finished --> [*] : free resources
-    Decoding --> Paused : preempted (memory pressure)
-    Paused --> Decoding : resumed
+    [*] --> Waiting
+    Waiting --> Prefill: scheduled
+    Prefill --> Decoding: first token generated
+    Decoding --> Decoding: next token
+    Decoding --> Finished: generation complete
+    Decoding --> Paused: preempted
+    Paused --> Decoding: resumed
+    Finished --> [*]
+    
+    note right of Waiting
+        Request arrives
+    end note
+    
+    note right of Paused
+        Memory pressure:
+        Swap KV cache to CPU
+    end note
+    
+    note right of Finished
+        Free resources
+    end note
 ```
 
 The scheduler may pause a low‑priority decode request and swap its KV cache to CPU if GPU memory is tight [7].
@@ -946,12 +959,22 @@ The scheduler may pause a low‑priority decode request and swap its KV cache to
 Long prompts create imbalance [11]:
 
 ```mermaid
-graph LR
-    WO1["Without Chunking:<br/>Time 0ms"] --> WO2["32K token prefill<br/>2-8 seconds<br/>200 decode users starved"]
-    WO2 --> WO3["Decode user 1: token 1"] --> WO4["Decode user 1: token 2"]
+graph TD
+    subgraph WithoutChunking["Without Chunking - Head-of-Line Blocking"]
+        WO1["Time 0ms: Start"] --> WO2["32K token prefill<br/>Takes 2-8 seconds<br/>Blocks all decode requests"]
+        WO2 --> WO3["Prefill complete<br/>200 decode users starved"]
+        WO3 --> WO4["Finally: Decode users get tokens<br/>High tail latency"]
+    end
     
-    WC1["With Chunking:<br/>Prefill chunk 1<br/>512 tokens"] --> WC2["Decode all users:<br/>1 step"]
-    WC2 --> WC3["Prefill chunk 2<br/>512 tokens"] --> WC4["Decode all users:<br/>1 step"]
+    subgraph WithChunking["With Chunking - Interleaved Execution"]
+        WC1["Prefill chunk 1<br/>512 tokens (50ms)"] --> WC2["Decode all users<br/>1 step each"]
+        WC2 --> WC3["Prefill chunk 2<br/>512 tokens (50ms)"]
+        WC3 --> WC4["Decode all users<br/>1 step each"]
+        WC4 --> WC5["Prefill chunk 3...<br/>Continue interleaving"]
+        WC5 --> WC6{"Prefill complete?"}
+        WC6 -->|Yes| WC7["Normal decode<br/>Low latency"]
+        WC6 -->|No| WC1
+    end
 ```
 
 ### 4.7 Implementation: Simple Continuous Batching Simulator
