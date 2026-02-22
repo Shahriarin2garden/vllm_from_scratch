@@ -132,9 +132,15 @@ graph TD
 #### Diagram 1.2: Arrival Patterns – Synthetic vs Real
 
 ```mermaid
+---
+config:
+  themeVariables:
+    xyChart:
+      plotColorPalette: "#2563eb"
+---
 xychart-beta
     title "Synthetic: Constant Rate"
-    x-axis ["time"]
+    x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     y-axis "Requests" 0 --> 10
     bar [5,5,5,5,5,5,5,5,5,5]
 ```
@@ -142,7 +148,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Real: Bursty Arrivals"
-    x-axis ["time"]
+    x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     y-axis "Requests" 0 --> 10
     bar [0,0,8,2,0,9,1,0,0,10]
 ```
@@ -154,7 +160,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Synthetic: Fixed Length"
-    x-axis ["prompt length (tokens)"]
+    x-axis [128, 256, 512, 1024, 2048]
     y-axis "Frequency" 0 --> 100
     bar [0,0,100,0,0]
 ```
@@ -162,7 +168,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Real: Heavy‑Tailed Length"
-    x-axis ["prompt length (tokens)"]
+    x-axis [128, 256, 512, 1024, 2048]
     y-axis "Frequency (log)" 0 --> 1000
     line [800,300,150,50,20]
 ```
@@ -459,7 +465,7 @@ Production workloads follow human activity patterns. The chart below shows reque
 ```mermaid
 xychart-beta
     title "Request Rate by Hour of Day (requests per second)"
-    x-axis ["00", "03", "06", "09", "12", "15", "18", "21", "24"]
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
     y-axis "RPS" 0 --> 600
     line [45, 30, 25, 120, 450, 520, 380, 210, 60]
 ```
@@ -471,11 +477,11 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Request Rate with 90% Confidence Interval"
-    x-axis ["00", "06", "12", "18", "24"]
+    x-axis [0, 6, 12, 18, 24]
     y-axis "RPS" 0 --> 700
-    line [45, 25, 520, 380, 60] "Mean"
-    line [55, 35, 580, 430, 70] "P95"
-    line [35, 15, 460, 330, 50] "P5"
+    line [45, 25, 520, 380, 60]
+    line [55, 35, 580, 430, 70]
+    line [35, 15, 460, 330, 50]
 ```
 
 *Explanation:* The shaded area between P5 and P95 shows the variability around the mean. During peak hours, the confidence band widens, indicating higher burstiness. This means that even within the same hour, the system must handle significant fluctuations.
@@ -485,7 +491,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Weekday Request Rate (Mon-Fri avg)"
-    x-axis ["00","03","06","09","12","15","18","21","24"]
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
     y-axis "RPS" 0 --> 600
     line [45,30,25,120,450,520,380,210,60]
 ```
@@ -497,7 +503,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Weekend Request Rate (Sat-Sun avg)"
-    x-axis ["00","03","06","09","12","15","18","21","24"]
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
     y-axis "RPS" 0 --> 100
     line [10,8,6,20,60,70,50,25,12]
 ```
@@ -509,7 +515,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Cumulative Requests by Hour"
-    x-axis ["00", "06", "12", "18", "24"]
+    x-axis [0, 6, 12, 18, 24]
     y-axis "Cumulative Requests (millions)" 0 --> 10
     line [0, 0.2, 3.5, 7.8, 10]
 ```
@@ -536,9 +542,9 @@ Requests do not arrive uniformly even within an hour. The inter‑arrival time d
 ```mermaid
 xychart-beta
     title "Inter‑arrival Time CDF"
-    x-axis "ms" 0 --> 200
+    x-axis [0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
     y-axis "CDF" 0 --> 1.0
-    line [0.0, 0.3, 0.55, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 0.98, 0.99, 1.0]
+    line [0.0, 0.3, 0.55, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 1.0]
 ```
 
 *Explanation:* The CDF shows that about 50% of requests arrive within 10 ms of the previous one, indicating dense clusters. Only 10% of inter‑arrival times exceed 100 ms. This burstiness stresses the scheduler.
@@ -548,7 +554,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Inter‑arrival Time Histogram"
-    x-axis "ms (log scale)" [1,3,10,30,100,300]
+    x-axis [1, 3, 10, 30, 100, 300]
     y-axis "Frequency" 0 --> 5000
     bar [4800, 3000, 1500, 500, 150, 50]
 ```
@@ -557,22 +563,7 @@ xychart-beta
 
 #### Diagram 3.8: Request Arrival Timeline (1‑minute window)
 
-```mermaid
-gantt
-    title Request Arrivals (1 minute)
-    dateFormat  ss.SSS
-    axisFormat %S.%L
-    
-    section Arrivals
-    Request 1 :0, 0.1ms
-    Request 2 :after 0.1ms, 0.1ms
-    Request 3 :after 0.1ms, 0.1ms
-    Request 4 :after 50ms, 0.1ms
-    Request 5 :after 0.1ms, 0.1ms
-    Request 6 :after 0.1ms, 0.1ms
-    Request 7 :after 100ms, 0.1ms
-    ...
-```
+*Note: Timeline visualization showing clustered request arrivals with short gaps followed by longer silences.*
 
 *Explanation:* This Gantt chart shows a snapshot of request arrivals. Notice clusters of requests with very short gaps, followed by longer silences. This pattern stresses the scheduler and queue.
 
@@ -581,9 +572,9 @@ gantt
 ```mermaid
 xychart-beta
     title "Queue Length Simulation"
-    x-axis "time (ms)" 0 --> 500
+    x-axis [0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
     y-axis "Queue Length" 0 --> 50
-    line [0,10,25,40,30,15,5,20,35,45,30,10,0]
+    line [0,10,25,40,30,15,5,20,35,45,30]
 ```
 
 *Explanation:* Simulating a queue with bursty arrivals shows that queue length can spike rapidly even if average rate is moderate. The scheduler must handle these spikes to avoid timeouts.
@@ -609,7 +600,7 @@ The distributions are heavy‑tailed and often follow a power law.
 xychart-beta
     title "Prompt Length Distribution"
     x-axis ["1-128", "129-512", "513-2048", "2049-4096", "4097-8192"]
-    y-axis "Frequency (%)" 0 --> 60
+    y-axis "Frequency (percent)" 0 --> 60
     bar [45, 30, 15, 7, 3]
 ```
 
@@ -620,23 +611,16 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Prompt Length CCDF (log‑log)"
-    x-axis "tokens (log)" [10,100,1000,10000]
-    y-axis "P(X > x) (log)" [1,0.1,0.01,0.001]
-    line [0.9,0.2,0.03,0.005]
+    x-axis [10, 100, 1000, 10000]
+    y-axis "P(X > x)" 0 --> 1.0
+    line [0.9, 0.2, 0.03, 0.005]
 ```
 
 *Explanation:* On a log‑log scale, a straight line indicates a power‑law distribution. The tail is heavy, meaning that very long prompts, though rare, are not negligible. This has implications for memory provisioning.
 
 #### Diagram 3.12: Response Length vs Prompt Length Scatter
 
-```mermaid
-xychart-beta
-    title "Response Length vs Prompt Length"
-    x-axis "Prompt tokens" 0 --> 8192
-    y-axis "Response tokens" 0 --> 2048
-    scatter
-        values [[128,64], [256,128], [512,256], [1024,512], [2048,1024], [4096,2048], [128,512], [8192,128]]
-```
+*Note: Scatter plot showing correlation between prompt and response lengths with high variability.*
 
 *Explanation:* Scatter plot shows that response length often correlates with prompt length, but there is high variability. Some short prompts can generate long responses and vice versa, adding to workload unpredictability.
 
@@ -645,7 +629,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Cumulative KV Cache Memory by Prompt Length"
-    x-axis "Prompt length (tokens)" 0 --> 8192
+    x-axis [0, 1024, 2048, 4096, 6144, 8192]
     y-axis "Cumulative Memory (GB)" 0 --> 100
     line [0,10,25,45,70,100]
 ```
@@ -700,7 +684,7 @@ Many applications (chat, code completion) involve sessions with multiple turns. 
 xychart-beta
     title "Session Duration Distribution"
     x-axis ["0-1m", "1-5m", "5-15m", "15-30m", "30-60m", ">60m"]
-    y-axis "Frequency (%)" 0 --> 50
+    y-axis "Frequency (percent)" 0 --> 50
     bar [40, 30, 15, 8, 5, 2]
 ```
 
@@ -712,7 +696,7 @@ xychart-beta
 xychart-beta
     title "Turns per Session Distribution"
     x-axis ["1", "2-3", "4-5", "6-10", ">10"]
-    y-axis "Frequency (%)" 0 --> 60
+    y-axis "Frequency (percent)" 0 --> 60
     bar [50, 30, 10, 7, 3]
 ```
 
@@ -723,8 +707,8 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "KV Cache Size Over Session Turns"
-    x-axis "Turn number" 1 --> 10
-    y-axis "Cache size (tokens)" 0 --> 2000
+    x-axis [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    y-axis "Cache size (tokens)" 0 --> 6000
     line [128, 384, 768, 1280, 1920, 2560, 3200, 3840, 4480, 5120]
 ```
 
@@ -732,14 +716,7 @@ xychart-beta
 
 #### Diagram 3.17: Session Inter‑arrival Time vs Session Duration
 
-```mermaid
-xychart-beta
-    title "Session Duration vs Time Between Sessions (User Level)"
-    x-axis "Session duration (min)" 0 --> 60
-    y-axis "Time to next session (min)" 0 --> 120
-    scatter
-        values [[1,10], [5,30], [15,60], [30,120], [60,240]]
-```
+*Note: Longer sessions tend to be followed by longer gaps before the next session.*
 
 *Explanation:* Longer sessions tend to be followed by longer gaps, but there is variability. This pattern can inform cache eviction policies: if a user just had a long session, they may not return soon, so their cache could be swapped out.
 
@@ -764,24 +741,17 @@ Real workloads rarely saturate the GPU fully. The following chart shows typical 
 ```mermaid
 xychart-beta
     title "GPU Resource Utilization Over 24h"
-    x-axis ["00", "03", "06", "09", "12", "15", "18", "21", "24"]
-    y-axis "Utilization %" 0 --> 100
-    line [20, 15, 12, 45, 80, 85, 70, 40, 25]  "Compute"
-    line [25, 20, 15, 55, 85, 90, 75, 45, 30]  "Memory Bandwidth"
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
+    y-axis "Utilization (percent)" 0 --> 100
+    line [20, 15, 12, 45, 80, 85, 70, 40, 25]
+    line [25, 20, 15, 55, 85, 90, 75, 45, 30]
 ```
 
 *Explanation:* Compute utilisation peaks at 85%, memory bandwidth at 90%. Memory bandwidth is consistently higher, indicating that inference is often memory‑bound. This means optimising memory access patterns yields greater gains than optimising compute.
 
 #### Diagram 4.2: Compute vs Memory Bandwidth Scatter
 
-```mermaid
-xychart-beta
-    title "Compute vs Memory Bandwidth (each point = 1 minute)"
-    x-axis "Compute %" 0 --> 100
-    y-axis "Memory BW %" 0 --> 100
-    scatter
-        values [[20,25], [40,50], [60,70], [80,90], [85,90], [50,55], [30,35]]
-```
+*Note: Most data points lie above the diagonal, confirming memory bandwidth utilization exceeds compute utilization.*
 
 *Explanation:* Most points lie above the diagonal line, confirming that memory bandwidth utilisation exceeds compute utilisation. This is characteristic of memory‑bound workloads.
 
@@ -790,10 +760,10 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "GPU Utilisation vs Request Rate"
-    x-axis "RPS" 0 --> 600
-    y-axis "Utilization %" 0 --> 100
-    line [0,20,40,60,80,90] "Compute"
-    line [0,25,50,75,90,95] "Memory BW"
+    x-axis [0, 100, 200, 300, 400, 500, 600]
+    y-axis "Utilization (percent)" 0 --> 100
+    line [0,20,40,60,80,90,95]
+    line [0,25,50,75,90,95,98]
 ```
 
 *Explanation:* As request rate increases, both utilisations rise, but memory bandwidth saturates earlier. This suggests that after a certain point, adding more requests does not increase throughput because memory bandwidth is the bottleneck.
@@ -835,10 +805,10 @@ Despite careful allocation, the KV cache is often underutilised due to fragmenta
 ```mermaid
 xychart-beta
     title "KV Cache Memory Allocation vs Usage"
-    x-axis ["00", "03", "06", "09", "12", "15", "18", "21", "24"]
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
     y-axis "GB" 0 --> 40
-    line [10, 8, 6, 18, 32, 35, 28, 16, 12]  "Allocated"
-    line [4, 3, 2, 8, 16, 18, 14, 7, 5]      "Used"
+    line [10, 8, 6, 18, 32, 35, 28, 16, 12]
+    line [4, 3, 2, 8, 16, 18, 14, 7, 5]
 ```
 
 *Explanation:* Allocated memory (reserved blocks) is much higher than actually used tokens. Utilisation hovers around 30–50%, indicating waste. This headroom could be reclaimed with better allocation strategies.
@@ -864,8 +834,8 @@ graph TD
 ```mermaid
 xychart-beta
     title "Fragmentation Over Time"
-    x-axis "time (hours)" 0 --> 24
-    y-axis "Fragmentation %" 0 --> 50
+    x-axis [0, 3, 6, 9, 12, 15, 18, 21, 24]
+    y-axis "Fragmentation (percent)" 0 --> 50
     line [10,15,22,28,35,40,38,32,25]
 ```
 
@@ -876,8 +846,8 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Internal Fragmentation vs Block Size"
-    x-axis "Block size (tokens)" [8,16,32,64,128]
-    y-axis "Average waste (%)" 0 --> 50
+    x-axis [8, 16, 32, 64, 128]
+    y-axis "Average waste (percent)" 0 --> 50
     bar [6,12,22,35,48]
 ```
 
@@ -973,7 +943,7 @@ pie title "Failure Mode Distribution"
 ```mermaid
 xychart-beta
     title "OOM Events by Hour"
-    x-axis ["00", "06", "12", "18", "24"]
+    x-axis [0, 6, 12, 18, 24]
     y-axis "OOM count" 0 --> 20
     line [2,1,15,10,3]
 ```
@@ -985,7 +955,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Timeout Probability vs Queue Length"
-    x-axis "Queue length (requests)" 0 --> 200
+    x-axis [0, 40, 80, 120, 160, 200]
     y-axis "Timeout probability" 0 --> 1.0
     line [0,0.1,0.3,0.6,0.9,1.0]
 ```
@@ -997,9 +967,9 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "P95 Latency Over 12 Hours"
-    x-axis "time (hours)" 0 --> 12
+    x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     y-axis "P95 Latency (ms)" 0 --> 500
-    line [120,125,140,180,250,380,450,460,470,480,490,500]
+    line [120,125,140,180,250,380,450,460,470,480,490,500,500]
 ```
 
 *Explanation:* The gradual increase in P95 latency indicates a systemic issue, such as memory fragmentation causing slower allocations, or a memory leak reducing available memory.
@@ -1095,9 +1065,9 @@ graph LR
 ```mermaid
 xychart-beta
     title "Queue Length Over Time (Burst)"
-    x-axis "time (ms)" 0 --> 500
+    x-axis [0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
     y-axis "Queue Length" 0 --> 100
-    line [0,20,50,80,100,60,30,10,0]
+    line [0,20,50,80,100,60,30,10,0,0,0]
 ```
 
 *Explanation:* A burst of requests causes queue length to spike. After the burst, the queue drains. Timeouts occur if the queue exceeds the timeout threshold.
@@ -1107,7 +1077,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Timeout Probability vs Batch Size"
-    x-axis "Batch Size" [1,2,4,8,16,32]
+    x-axis [1, 2, 4, 8, 16, 32]
     y-axis "Timeout Probability" 0 --> 1.0
     line [0.5,0.3,0.2,0.1,0.05,0.02]
 ```
@@ -1119,10 +1089,10 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Queue Length With and Without Admission Control"
-    x-axis "time (ms)" 0 --> 500
+    x-axis [0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
     y-axis "Queue Length" 0 --> 100
-    line [0,20,50,80,100,60,30,10,0] "No control"
-    line [0,20,40,50,40,20,10,0,0] "With admission"
+    line [0,20,50,80,100,60,30,10,0,0,0]
+    line [0,20,40,50,40,20,10,0,0,0,0]
 ```
 
 *Explanation:* Admission control rejects some requests early when queue is long, preventing the queue from growing too large and reducing timeouts for accepted requests.
@@ -1158,9 +1128,9 @@ Monitoring metrics like average latency and GPU utilisation over time can reveal
 ```mermaid
 xychart-beta
     title "Fragmentation Over Time"
-    x-axis "hours" 0 --> 12
-    y-axis "Fragmentation %" 0 --> 50
-    line [10,15,20,28,35,42,48,49,50,50,50,50]
+    x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    y-axis "Fragmentation (percent)" 0 --> 50
+    line [10,15,20,28,35,42,48,49,50,50,50,50,50]
 ```
 
 *Explanation:* Fragmentation increases over time, then plateaus when it reaches a steady state where allocations and frees balance. High fragmentation leads to slower allocation and potential OOM.
@@ -1170,9 +1140,9 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Memory Usage Over Time (Leak)"
-    x-axis "hours" 0 --> 12
+    x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     y-axis "Memory Used (GB)" 0 --> 40
-    line [10,12,15,19,24,30,35,38,40,40,40,40]
+    line [10,12,15,19,24,30,35,38,40,40,40,40,40]
 ```
 
 *Explanation:* A memory leak causes used memory to increase steadily until it hits a limit, after which OOM errors occur. The plateau may indicate the leak stopped or memory pressure caused throttling.
@@ -1182,10 +1152,10 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Latency Control Chart"
-    x-axis "time (minutes)" 0 --> 60
+    x-axis [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
     y-axis "Latency (ms)" 0 --> 300
-    line [120,125,118,130,122,128,135,140,150,180,220,260] "Observed"
-    line [130,130,130,130,130,130,130,130,130,130,130,130] "Upper control limit"
+    line [120,125,118,130,122,128,135,140,150,180,220,260,280]
+    line [130,130,130,130,130,130,130,130,130,130,130,130,130]
 ```
 
 *Explanation:* When observed latency consistently exceeds the upper control limit, it signals a degradation that requires investigation. Control charts help automate anomaly detection.
@@ -1273,10 +1243,10 @@ graph TD
 ```mermaid
 xychart-beta
     title "Block Size Trade‑offs"
-    x-axis "Block size" [8,16,32,64,128]
+    x-axis [8, 16, 32, 64, 128]
     y-axis "Value" 0 --> 100
-    line [20,15,10,5,2] "Kernel overhead (lower better)"
-    line [6,12,22,35,48] "Fragmentation % (lower better)"
+    line [20,15,10,5,2]
+    line [6,12,22,35,48]
 ```
 
 *Explanation:* Small blocks reduce fragmentation but increase kernel overhead (more blocks to manage). Block size 16 balances both, offering reasonable fragmentation (~12%) without excessive overhead.
@@ -1286,10 +1256,10 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Batch Size Impact"
-    x-axis "Batch size" [1,2,4,8,16,32,64]
+    x-axis [1, 2, 4, 8, 16, 32, 64]
     y-axis "Value" 0 --> 100
-    line [10,18,32,55,75,90,95] "Throughput (req/s)"
-    line [10,12,15,20,30,50,90] "P95 Latency (ms)"
+    line [10,18,32,55,75,90,95]
+    line [10,12,15,20,30,50,90]
 ```
 
 *Explanation:* Throughput increases with batch size but saturates around 32 due to memory bandwidth. Latency increases superlinearly after 32. The sweet spot is 16‑32, balancing throughput and latency.
@@ -1299,7 +1269,7 @@ xychart-beta
 ```mermaid
 xychart-beta
     title "Peak Queue Length vs Scheduling Interval"
-    x-axis "Scheduling interval (ms)" [1,2,5,10,20,50]
+    x-axis [1, 2, 5, 10, 20, 50]
     y-axis "Peak queue length" 0 --> 200
     line [20,25,40,80,150,190]
 ```
