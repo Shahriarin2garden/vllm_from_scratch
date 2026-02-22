@@ -316,11 +316,11 @@ flowchart LR
 ```mermaid
 gantt
     title Log Events Timeline
-    dateFormat  HH:MM:ss
-    axisFormat %H:%M:%S
+    dateFormat YYYY-MM-DD
+    axisFormat %L ms
     
     section API Gateway
-    Request received    :api_start, 00:00:00, 1ms
+    Request received    :api_start, 2024-01-01, 1ms
     Response sent       :api_end, after api_start, 1ms
     
     section Scheduler
