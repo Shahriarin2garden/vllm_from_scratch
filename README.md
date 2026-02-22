@@ -62,6 +62,7 @@ Each lab directory contains its own `README.md` with detailed instructions and c
 - **Lab 0.1:** Tokenizer, embedding, and the forward pass with KV cache.
 - **Lab 0.2:** Prefill/decode phases and a continuous batching scheduler.
 - **Lab 0.3:** PagedAttention memory manager and FlashAttention integration.
+- **Lab 0.4:** Real‑world trace analysis and data‑driven system design.
 
 ---
 
@@ -237,6 +238,40 @@ graph TD
 
 ---
 
+## Lab 0.4: Real‑World Trace Analysis
+
+**Scope:** Data‑driven analysis of production inference workloads.
+
+**What You Will Build:**
+- A workload analysis report from production‑like traces.
+- Visualizations of temporal patterns, burstiness, and length distributions.
+- Resource utilization metrics (GPU compute, memory bandwidth, KV cache).
+- Diagnosis of failure patterns (OOM, timeouts, degradation).
+- Concrete system parameters derived from trace insights.
+
+**Key Concepts:**
+- Synthetic vs. real workload characteristics.
+- Heavy‑tailed distributions and their impact on resource planning.
+- Memory‑bound vs. compute‑bound workload identification.
+- Fragmentation analysis and its effect on utilization.
+- Translating analytical insights into design decisions.
+
+**Diagram: Insight‑to‑Design Mapping**
+
+```mermaid
+graph TD
+    A[Temporal variability] --> A1[Adaptive batching]
+    B[Heavy‑tailed lengths] --> B1[Block size = 16]
+    C[Bursty arrivals] --> C1[Fast scheduler 2ms]
+    D[Memory‑bound] --> D1[KV cache optimised kernels]
+    E[Fragmentation] --> E1[PagedAttention]
+    F[Failure modes] --> F1[Admission control, pre‑emption]
+```
+
+**Diagram Explanation:** Real‑world trace analysis reveals patterns that directly inform system design. Temporal variability drives adaptive batching, heavy‑tailed length distributions determine optimal block size, bursty arrivals require fast scheduling, memory‑bound workloads need optimized kernels, fragmentation necessitates PagedAttention, and observed failure modes guide admission control strategies.
+
+---
+
 ## Epilogue: The Complete System
 
 After completing the three labs, you will have built a fully functional inference engine with the following components:
@@ -250,6 +285,7 @@ After completing the three labs, you will have built a fully functional inferenc
 | Chunked prefill | Prevent head‑of‑line blocking | 0.2 |
 | PagedAttention memory manager | Zero‑fragmentation KV cache | 0.3 |
 | FlashAttention integration | IO‑aware attention kernel | 0.3 |
+| Workload analysis & system parameters | Data‑driven design decisions | 0.4 |
 
 The system can serve multiple concurrent requests on a single GPU, achieving **90%+ memory efficiency** and **10–20× throughput** compared to naive implementations. You will have learned to:
 
@@ -275,7 +311,7 @@ The system can serve multiple concurrent requests on a single GPU, achieving **9
 
 ## Next Steps
 
-- Complete the three labs in sequence.
+- Complete the four labs in sequence.
 - Extend the engine with **speculative decoding** to break the sequential bottleneck.
 - Implement **multi‑GPU inference** using tensor parallelism.
 - Add **quantization** (FP8, INT4) to reduce memory and increase throughput.
