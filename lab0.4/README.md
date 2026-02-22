@@ -90,6 +90,14 @@ Expected output (approximate): `(100000, 12)`
 
 ## Chapter 1: The Case for Real‑World Analysis
 
+**What you'll learn:** Why synthetic benchmarks fail to capture production behavior, and how real-world traces reveal critical patterns like bursty arrivals, heavy-tailed distributions, and session dependencies.
+
+**Key takeaway:** Production workloads exhibit 10× variability that synthetic benchmarks miss, leading to incorrect capacity planning and unexpected failures.
+
+**Time estimate:** 20 minutes
+
+---
+
 ### 1.1 Why Synthetic Benchmarks Lie
 
 Benchmarks such as `gpt‑bench` or `lm‑eval` typically send fixed‑length prompts at a constant rate. They measure peak throughput under ideal conditions, but they miss critical real‑world phenomena:
@@ -221,6 +229,14 @@ This report will serve as the requirements document for the nano‑vLLM engine y
 ---
 
 ## Chapter 2: Anatomy of Production Traces
+
+**What you'll learn:** The structure of production traces, how to join multiple data sources (API logs, GPU telemetry, error logs), and what fields matter for inference analysis.
+
+**Key takeaway:** Unified traces from multiple sources enable holistic system analysis and root cause diagnosis.
+
+**Time estimate:** 25 minutes
+
+---
 
 ### 2.1 Data Sources
 
@@ -457,6 +473,14 @@ Match each statistical term to its meaning in the context of prompt lengths.
 ---
 
 ## Chapter 3: Temporal Patterns and Request Characteristics
+
+**What you'll learn:** How to identify and quantify diurnal cycles, request burstiness, length distributions, and multi-turn session behavior from trace data.
+
+**Key takeaway:** Real traffic shows 10× peak-to-trough variation, 50% of requests arrive in dense bursts, and prompt lengths follow heavy-tailed distributions where the top 1% consumes disproportionate resources.
+
+**Time estimate:** 35 minutes
+
+---
 
 ### 3.1 Diurnal Cycles
 
@@ -734,6 +758,14 @@ xychart-beta
 
 ## Chapter 4: Resource Utilization Under Real Workloads
 
+**What you'll learn:** How to measure GPU compute, memory bandwidth, and KV cache utilization, and why memory bandwidth typically limits throughput in inference workloads.
+
+**Key takeaway:** Inference is memory-bound (90% memory bandwidth vs 85% compute), and KV cache utilization averages only 40-50% due to fragmentation, revealing significant optimization headroom.
+
+**Time estimate:** 30 minutes
+
+---
+
 ### 4.1 GPU Compute and Memory Bandwidth
 
 Real workloads rarely saturate the GPU fully. The following chart shows typical utilisation over a day.
@@ -914,6 +946,14 @@ It indicates severe fragmentation or over‑allocation. The system has reserved 
 ---
 
 ## Chapter 5: Failure Patterns and Performance Degradation
+
+**What you'll learn:** How to diagnose common failure modes (OOM, timeouts, degradation) from traces, understand their root causes, and recognize early warning signs.
+
+**Key takeaway:** OOM occurs even with free memory due to fragmentation, timeouts spike during bursts when queue length exceeds thresholds, and gradual latency increases signal systemic issues like memory leaks.
+
+**Time estimate:** 30 minutes
+
+---
 
 ### 5.1 Common Failure Modes
 
@@ -1212,6 +1252,14 @@ Run this simulation with different allocation patterns and observe fragmentation
 ---
 
 ## Chapter 6: From Analysis to System Design
+
+**What you'll learn:** How to translate trace insights into concrete system parameters: batch sizes, block sizes, scheduling intervals, and memory headroom requirements.
+
+**Key takeaway:** Data-driven design decisions—block size 16, batch size 8-32, scheduling interval 2ms, 25% memory headroom—directly address observed workload characteristics and failure modes.
+
+**Time estimate:** 25 minutes
+
+---
 
 ### 6.1 Key Insights Recap
 
