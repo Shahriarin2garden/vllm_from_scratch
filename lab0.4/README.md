@@ -118,8 +118,6 @@ graph TD
     subgraph Real
         B1[Bursty arrivals] --> B2[Heavy‑tailed lengths] --> B3[Multi‑turn sessions]
     end
-    style Synthetic fill:#e0e0e0
-    style Real fill:#f9f9f9
 ```
 
 *Explanation:* Synthetic workloads use a constant rate, fixed lengths, and isolated requests. Real workloads exhibit bursts, variable lengths, and session continuity. This mismatch leads to incorrect performance predictions. The diagram highlights the core differences that make real‑world analysis essential.
@@ -140,12 +138,6 @@ graph TD
 #### Diagram 1.2: Arrival Patterns – Synthetic vs Real
 
 ```mermaid
----
-config:
-  themeVariables:
-    xyChart:
-      plotColorPalette: "#2563eb"
----
 xychart-beta
     title "Synthetic: Constant Rate"
     x-axis [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -1042,25 +1034,10 @@ sequenceDiagram
 #### Diagram 5.6: Memory State After Allocations (Visual)
 
 ```mermaid
-graph TD
-    subgraph After ReqC
-        style A0 fill:lightgreen
-        style A1 fill:lightgreen
-        style A2 fill:lightgreen
-        style A3 fill:lightgreen
-        style A4 fill:lightgreen
-        style A5 fill:lightgreen
-        style A6 fill:lightgreen
-        style A7 fill:lightgreen
-        style A8 fill:white
-        style A9 fill:white
-        style A10 fill:lightblue
-        style A11 fill:lightblue
-        
-        A0(Block 0) --> A1(Block 1) --> A2(Block 2) --> A3(Block 3) --> A4(Block 4) --> A5(Block 5) --> A6(Block 6) --> A7(Block 7)
-        A8(Block 8 free) --> A9(Block 9 free)
-        A10(Block 10 ReqB) --> A11(Block 11 ReqB)
-    end
+flowchart LR
+    A0["Block 0<br/>ReqC"] --> A1["Block 1<br/>ReqC"] --> A2["Block 2<br/>ReqC"] --> A3["Block 3<br/>ReqC"]
+    A3 --> A4["Block 4<br/>ReqC"] --> A5["Block 5<br/>ReqC"] --> A6["Block 6<br/>ReqC"] --> A7["Block 7<br/>ReqC"]
+    A7 --> A8["Block 8<br/>free"] --> A9["Block 9<br/>free"] --> A10["Block 10<br/>ReqB"] --> A11["Block 11<br/>ReqB"]
 ```
 
 *Explanation:* Blocks 0-7 are allocated to ReqC, blocks 10-11 to ReqB. Free blocks are 8 and 9, which are contiguous but only two blocks. A request for 4 contiguous blocks would fail, illustrating external fragmentation.
@@ -1068,16 +1045,10 @@ graph TD
 #### Diagram 5.7: Paged Allocation Eliminates External Fragmentation
 
 ```mermaid
-graph TD
-    subgraph Paged
-        B0(Block 0) --> B1(Block 1) --> B2(Block 2) --> B3(Block 3)
-        B4(Block 4 free) --> B5(Block 5 free) --> B6(Block 6 free) --> B7(Block 7 free)
-        B8(Block 8) --> B9(Block 9)
-    end
-    style B4 fill:white
-    style B5 fill:white
-    style B6 fill:white
-    style B7 fill:white
+flowchart LR
+    B0["Block 0<br/>allocated"] --> B1["Block 1<br/>allocated"] --> B2["Block 2<br/>allocated"] --> B3["Block 3<br/>allocated"]
+    B3 --> B4["Block 4<br/>free"] --> B5["Block 5<br/>free"] --> B6["Block 6<br/>free"] --> B7["Block 7<br/>free"]
+    B7 --> B8["Block 8<br/>allocated"] --> B9["Block 9<br/>allocated"]
 ```
 
 *Explanation:* In a paged allocator, any free block can be used regardless of contiguity. A request for 4 blocks can take blocks 4,5,6,7 even though they are not contiguous with other allocated blocks. This eliminates external fragmentation.
@@ -1087,15 +1058,10 @@ graph TD
 When request rate exceeds the system's ability to schedule and process, the queue grows.
 
 ```mermaid
-graph LR
-    subgraph Scheduler Queue
-        Q[(Queue)]
-    end
-    Incoming[Incoming Requests] --> Q
+flowchart LR
+    Incoming[Incoming Requests] --> Q[(Queue)]
     Q -->|Dequeue| Worker[GPU Worker]
     Worker -->|Processed| Done[Done]
-
-    Note over Q: Queue length spikes > threshold → timeout
 ```
 
 *Explanation:* As requests arrive faster than they can be processed, the queue builds. If queue length exceeds a threshold (or requests wait too long), they time out.
